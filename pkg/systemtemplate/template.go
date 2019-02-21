@@ -21,15 +21,17 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRoleBinding
 metadata:
-  name: cattle
+  name: cattle-admin-binding
   namespace: cattle-system
+  labels:
+    cattle.io/creator: "norman"
 subjects:
 - kind: ServiceAccount
   name: cattle
   namespace: cattle-system
 roleRef:
   kind: ClusterRole
-  name: cluster-admin
+  name: cattle-admin
   apiGroup: rbac.authorization.k8s.io
 
 ---
@@ -43,6 +45,26 @@ type: Opaque
 data:
   url: "{{.URL}}"
   token: "{{.Token}}"
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cattle-admin
+  labels:
+    cattle.io/creator: "norman"
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - '*'
+- nonResourceURLs:
+  - '*'
+  verbs:
+  - '*'
 
 ---
 
@@ -60,6 +82,15 @@ spec:
       labels:
         app: cattle-cluster-agent
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: beta.kubernetes.io/os
+                  operator: NotIn
+                  values:
+                    - windows
       serviceAccountName: cattle
       containers:
         - name: cluster-register
@@ -99,8 +130,24 @@ spec:
       labels:
         app: cattle-agent
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: beta.kubernetes.io/os
+                  operator: NotIn
+                  values:
+                    - windows
       hostNetwork: true
       serviceAccountName: cattle
+      tolerations:
+      - effect: NoExecute
+        key: "node-role.kubernetes.io/etcd"
+        value: "true"
+      - effect: NoSchedule
+        key: "node-role.kubernetes.io/controlplane"
+        value: "true"
       containers:
       - name: agent
         image: {{.AgentImage}}
@@ -150,4 +197,66 @@ spec:
           secretName: cattle-credentials-{{.TokenKey}}
   updateStrategy:
     type: RollingUpdate
+
+{{- if .AuthImage}}
+
+---
+
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+    name: kube-api-auth
+    namespace: cattle-system
+spec:
+  selector:
+    matchLabels:
+      app: kube-api-auth
+  template:
+    metadata:
+      labels:
+        app: kube-api-auth
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: beta.kubernetes.io/os
+                  operator: NotIn
+                  values:
+                    - windows
+      hostNetwork: true
+      serviceAccountName: cattle
+      tolerations:
+      - effect: NoExecute
+        key: "node-role.kubernetes.io/etcd"
+        value: "true"
+      - effect: NoSchedule
+        key: "node-role.kubernetes.io/controlplane"
+        value: "true"
+      containers:
+      - name: kube-api-auth
+        image: {{.AuthImage}}
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: k8s-ssl
+          mountPath: /etc/kubernetes
+        securityContext:
+          privileged: true
+      volumes:
+      - name: k8s-ssl
+        hostPath:
+          path: /etc/kubernetes
+          type: DirectoryOrCreate
+  updateStrategy:
+    type: RollingUpdate
+{{- end }}
+`
+
+var AuthDaemonSet = `
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+    name: kube-api-auth
+    namespace: cattle-system
 `

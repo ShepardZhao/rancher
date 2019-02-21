@@ -11,8 +11,8 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/rancher/norman/pkg/remotedialer"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/remotedialer"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/client/management/v3"
 	"github.com/rancher/types/config"
@@ -41,14 +41,8 @@ type input struct {
 	Cluster *cluster     `json:"cluster"`
 }
 
-func NewTunnelServer(context *config.ScaledContext, authorizer *Authorizer) *remotedialer.Server {
-	ready := func() bool {
-		return context.Leader
-	}
-	return remotedialer.New(authorizer.authorizeTunnel, func(rw http.ResponseWriter, req *http.Request, code int, err error) {
-		rw.WriteHeader(code)
-		rw.Write([]byte(err.Error()))
-	}, ready)
+func NewTunnelServer(authorizer *Authorizer) *remotedialer.Server {
+	return remotedialer.New(authorizer.authorizeTunnel, remotedialer.DefaultErrorWriter)
 }
 
 func NewAuthorizer(context *config.ScaledContext) *Authorizer {
@@ -88,7 +82,7 @@ type Client struct {
 func (t *Authorizer) authorizeTunnel(req *http.Request) (string, bool, error) {
 	client, ok, err := t.Authorize(req)
 	if client != nil && client.Node != nil {
-		return client.Node.Name, ok, err
+		return client.Cluster.Name + ":" + client.Node.Name, ok, err
 	} else if client != nil && client.Cluster != nil {
 		return client.Cluster.Name, ok, err
 	}
@@ -157,7 +151,6 @@ func (t *Authorizer) Authorize(req *http.Request) (*Client, bool, error) {
 
 func (t *Authorizer) getMachine(cluster *v3.Cluster, inNode *client.Node) (*v3.Node, error) {
 	machineName := machineName(inNode)
-
 	machine, err := t.machineLister.Get(cluster.Name, machineName)
 	if apierrors.IsNotFound(err) {
 		if objs, err := t.nodeIndexer.ByIndex(nodeKeyIndex, fmt.Sprintf("%s/%s", cluster.Name, inNode.RequestedHostname)); err == nil {
@@ -221,7 +214,6 @@ func (t *Authorizer) createNode(inNode *client.Node, cluster *v3.Cluster, req *h
 			Etcd:              inNode.Etcd,
 			ControlPlane:      inNode.ControlPlane,
 			Worker:            inNode.Worker,
-			ClusterName:       cluster.Name,
 			RequestedHostname: inNode.RequestedHostname,
 			CustomConfig:      customConfig,
 			Imported:          true,

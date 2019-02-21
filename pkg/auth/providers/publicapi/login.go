@@ -1,6 +1,7 @@
 package publicapi
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
@@ -9,8 +10,11 @@ import (
 	"github.com/rancher/norman/types"
 	"github.com/rancher/rancher/pkg/auth/providers"
 	"github.com/rancher/rancher/pkg/auth/providers/activedirectory"
+	"github.com/rancher/rancher/pkg/auth/providers/azure"
 	"github.com/rancher/rancher/pkg/auth/providers/github"
+	"github.com/rancher/rancher/pkg/auth/providers/ldap"
 	"github.com/rancher/rancher/pkg/auth/providers/local"
+	"github.com/rancher/rancher/pkg/auth/providers/saml"
 	"github.com/rancher/rancher/pkg/auth/tokens"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/apis/management.cattle.io/v3public"
@@ -25,14 +29,16 @@ const (
 	CookieName = "R_SESS"
 )
 
-func newLoginHandler(mgmt *config.ScaledContext) *loginHandler {
+func newLoginHandler(ctx context.Context, mgmt *config.ScaledContext) *loginHandler {
 	return &loginHandler{
-		mgr: mgmt.UserManager,
+		userMGR:  mgmt.UserManager,
+		tokenMGR: tokens.NewManager(ctx, mgmt),
 	}
 }
 
 type loginHandler struct {
-	mgr user.Manager
+	userMGR  user.Manager
+	tokenMGR *tokens.Manager
 }
 
 func (h *loginHandler) login(actionName string, action *types.Action, request *types.APIContext) error {
@@ -61,6 +67,8 @@ func (h *loginHandler) login(actionName string, action *types.Action, request *t
 			HttpOnly: true,
 		}
 		http.SetCookie(w, tokenCookie)
+	} else if responseType == "saml" {
+		return nil
 	} else {
 		tokenData, err := tokens.ConvertTokenResource(request.Schemas.Schema(&schema.PublicVersion, client.TokenType), token)
 		if err != nil {
@@ -74,6 +82,9 @@ func (h *loginHandler) login(actionName string, action *types.Action, request *t
 }
 
 func (h *loginHandler) createLoginToken(request *types.APIContext) (v3.Token, string, error) {
+	var userPrincipal v3.Principal
+	var groupPrincipals []v3.Principal
+	var providerToken string
 	logrus.Debugf("Create Token Invoked")
 
 	bytes, err := ioutil.ReadAll(request.Request.Body)
@@ -104,6 +115,27 @@ func (h *loginHandler) createLoginToken(request *types.APIContext) (v3.Token, st
 	case client.ActiveDirectoryProviderType:
 		input = &v3public.BasicLogin{}
 		providerName = activedirectory.Name
+	case client.AzureADProviderType:
+		input = &v3public.AzureADLogin{}
+		providerName = azure.Name
+	case client.OpenLdapProviderType:
+		input = &v3public.BasicLogin{}
+		providerName = ldap.OpenLdapName
+	case client.FreeIpaProviderType:
+		input = &v3public.BasicLogin{}
+		providerName = ldap.FreeIpaName
+	case client.PingProviderType:
+		input = &v3public.SamlLoginInput{}
+		providerName = saml.PingName
+	case client.ADFSProviderType:
+		input = &v3public.SamlLoginInput{}
+		providerName = saml.ADFSName
+	case client.KeyCloakProviderType:
+		input = &v3public.SamlLoginInput{}
+		providerName = saml.KeyCloakName
+	case client.OKTAProviderType:
+		input = &v3public.SamlLoginInput{}
+		providerName = saml.OKTAName
 	default:
 		return v3.Token{}, "", httperror.NewAPIError(httperror.ServerError, "unknown authentication provider")
 	}
@@ -115,7 +147,15 @@ func (h *loginHandler) createLoginToken(request *types.APIContext) (v3.Token, st
 	}
 
 	// Authenticate User
-	userPrincipal, groupPrincipals, providerInfo, err := providers.AuthenticateUser(input, providerName)
+	// SAML's login flow is different from the other providers. Unlike the other providers, it gets the logged in user's data via a POST from
+	// the identity provider on a separate endpoint specifically for that.
+	if providerName == saml.PingName || providerName == saml.ADFSName || providerName == saml.KeyCloakName ||
+		providerName == saml.OKTAName {
+		err = saml.PerformSamlLogin(providerName, request, input)
+		return v3.Token{}, "saml", err
+	}
+
+	userPrincipal, groupPrincipals, providerToken, err = providers.AuthenticateUser(input, providerName)
 	if err != nil {
 		return v3.Token{}, "", err
 	}
@@ -126,11 +166,15 @@ func (h *loginHandler) createLoginToken(request *types.APIContext) (v3.Token, st
 	if displayName == "" {
 		displayName = userPrincipal.LoginName
 	}
-	user, err := h.mgr.EnsureUser(userPrincipal.Name, displayName)
+	user, err := h.userMGR.EnsureUser(userPrincipal.Name, displayName)
 	if err != nil {
 		return v3.Token{}, "", err
 	}
 
-	rToken, err := tokens.NewLoginToken(user.Name, userPrincipal, groupPrincipals, providerInfo, ttl, description)
+	if user.Enabled != nil && !*user.Enabled {
+		return v3.Token{}, "", httperror.NewAPIError(httperror.PermissionDenied, "Permission Denied")
+	}
+
+	rToken, err := h.tokenMGR.NewLoginToken(user.Name, userPrincipal, groupPrincipals, providerToken, ttl, description)
 	return rToken, responseType, err
 }

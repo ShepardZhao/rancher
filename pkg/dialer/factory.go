@@ -3,15 +3,12 @@ package dialer
 import (
 	"fmt"
 	"net"
-	"time"
-
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/rancher/norman/pkg/remotedialer"
 	"github.com/rancher/norman/types/slice"
-	"github.com/rancher/rancher/pkg/encryptedstore"
-	"github.com/rancher/rancher/pkg/nodeconfig"
-	"github.com/rancher/rancher/pkg/remotedialer"
 	"github.com/rancher/rancher/pkg/tunnelserver"
 	"github.com/rancher/rke/k8s"
 	"github.com/rancher/rke/services"
@@ -20,39 +17,25 @@ import (
 	"github.com/rancher/types/config/dialer"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
 )
 
-func NewFactory(apiContext *config.ScaledContext) (dialer.Factory, error) {
+func NewFactory(apiContext *config.ScaledContext) (*Factory, error) {
 	authorizer := tunnelserver.NewAuthorizer(apiContext)
-	tunneler := tunnelserver.NewTunnelServer(apiContext, authorizer)
-
-	secretStore, err := nodeconfig.NewStore(apiContext.Core.Namespaces(""), apiContext.K8sClient.CoreV1())
-	if err != nil {
-		return nil, err
-	}
-
-	apiContext.Management.Nodes("local").Controller().Informer().AddIndexers(cache.Indexers{
-		nodeAccessIndexer: nodeIndexer,
-	})
+	tunneler := tunnelserver.NewTunnelServer(authorizer)
 
 	return &Factory{
-		clusterLister:       apiContext.Management.Clusters("").Controller().Lister(),
-		localNodeController: apiContext.Management.Nodes("local").Controller(),
-		nodeLister:          apiContext.Management.Nodes("").Controller().Lister(),
-		TunnelServer:        tunneler,
-		TunnelAuthorizer:    authorizer,
-		store:               secretStore,
+		clusterLister:    apiContext.Management.Clusters("").Controller().Lister(),
+		nodeLister:       apiContext.Management.Nodes("").Controller().Lister(),
+		TunnelServer:     tunneler,
+		TunnelAuthorizer: authorizer,
 	}, nil
 }
 
 type Factory struct {
-	localNodeController v3.NodeController
-	nodeLister          v3.NodeLister
-	clusterLister       v3.ClusterLister
-	TunnelServer        *remotedialer.Server
-	TunnelAuthorizer    *tunnelserver.Authorizer
-	store               *encryptedstore.GenericEncryptedStore
+	nodeLister       v3.NodeLister
+	clusterLister    v3.ClusterLister
+	TunnelServer     *remotedialer.Server
+	TunnelAuthorizer *tunnelserver.Authorizer
 }
 
 func (f *Factory) ClusterDialer(clusterName string) (dialer.Dialer, error) {
@@ -199,15 +182,12 @@ func (f *Factory) DockerDialer(clusterName, machineName string) (dialer.Dialer, 
 		return nil, err
 	}
 
-	if f.TunnelServer.HasSession(machine.Name) {
-		d := f.TunnelServer.Dialer(machine.Name, 15*time.Second)
+	sessionKey := machineSessionKey(machine)
+	if f.TunnelServer.HasSession(sessionKey) {
+		d := f.TunnelServer.Dialer(sessionKey, 15*time.Second)
 		return func(string, string) (net.Conn, error) {
 			return d("unix", "/var/run/docker.sock")
 		}, nil
-	}
-
-	if machine.Spec.NodeTemplateName != "" {
-		return f.tlsDialer(machine)
 	}
 
 	return nil, fmt.Errorf("can not build dialer to %s:%s", clusterName, machineName)
@@ -229,10 +209,15 @@ func (f *Factory) nodeDialer(clusterName, machineName string) (dialer.Dialer, er
 		return nil, err
 	}
 
-	if f.TunnelServer.HasSession(machine.Name) {
-		d := f.TunnelServer.Dialer(machine.Name, 15*time.Second)
+	sessionKey := machineSessionKey(machine)
+	if f.TunnelServer.HasSession(sessionKey) {
+		d := f.TunnelServer.Dialer(sessionKey, 15*time.Second)
 		return dialer.Dialer(d), nil
 	}
 
 	return nil, fmt.Errorf("can not build dialer to %s:%s", clusterName, machineName)
+}
+
+func machineSessionKey(machine *v3.Node) string {
+	return fmt.Sprintf("%s:%s", machine.Namespace, machine.Name)
 }

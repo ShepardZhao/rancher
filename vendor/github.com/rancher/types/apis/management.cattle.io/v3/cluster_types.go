@@ -1,12 +1,21 @@
 package v3
 
 import (
+	"bytes"
+	"encoding/gob"
+
 	"github.com/rancher/norman/condition"
 	"github.com/rancher/norman/types"
+	"github.com/sirupsen/logrus"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
 )
+
+func init() {
+	gob.Register(map[string]interface{}{})
+	gob.Register([]interface{}{})
+}
 
 type ClusterConditionType string
 
@@ -24,21 +33,31 @@ const (
 	ClusterConditionNoDiskPressure condition.Cond = "NoDiskPressure"
 	// ClusterConditionNoMemoryPressure true when all cluster nodes have sufficient memory
 	ClusterConditionNoMemoryPressure condition.Cond = "NoMemoryPressure"
-	// ClusterConditionconditionDefautlProjectCreated true when default project has been created
-	ClusterConditionconditionDefautlProjectCreated condition.Cond = "DefaultProjectCreated"
+	// ClusterConditionconditionDefaultProjectCreated true when default project has been created
+	ClusterConditionconditionDefaultProjectCreated condition.Cond = "DefaultProjectCreated"
+	// ClusterConditionconditionSystemProjectCreated true when system project has been created
+	ClusterConditionconditionSystemProjectCreated condition.Cond = "SystemProjectCreated"
 	// ClusterConditionDefaultNamespaceAssigned true when cluster's default namespace has been initially assigned
 	ClusterConditionDefaultNamespaceAssigned condition.Cond = "DefaultNamespaceAssigned"
 	// ClusterConditionSystemNamespacesAssigned true when cluster's system namespaces has been initially assigned to
 	// a system project
-	ClusterConditionSystemNamespacesAssigned condition.Cond = "SystemNamespacesAssigned"
-	ClusterConditionAddonDeploy              condition.Cond = "AddonDeploy"
-	ClusterConditionSystemAccountCreated     condition.Cond = "SystemAccountCreated"
-	ClusterConditionAgentDeployed            condition.Cond = "AgentDeployed"
-	ClusterConditionGlobalAdminsSynced       condition.Cond = "GlobalAdminsSynced"
+	ClusterConditionSystemNamespacesAssigned   condition.Cond = "SystemNamespacesAssigned"
+	ClusterConditionAddonDeploy                condition.Cond = "AddonDeploy"
+	ClusterConditionSystemAccountCreated       condition.Cond = "SystemAccountCreated"
+	ClusterConditionAgentDeployed              condition.Cond = "AgentDeployed"
+	ClusterConditionGlobalAdminsSynced         condition.Cond = "GlobalAdminsSynced"
+	ClusterConditionInitialRolesPopulated      condition.Cond = "InitialRolesPopulated"
+	ClusterConditionServiceAccountMigrated     condition.Cond = "ServiceAccountMigrated"
+	ClusterConditionPrometheusOperatorDeployed condition.Cond = "PrometheusOperatorDeployed"
+	ClusterConditionMonitoringEnabled          condition.Cond = "MonitoringEnabled"
+	ClusterConditionAlertingEnabled            condition.Cond = "AlertingEnabled"
 
 	ClusterDriverImported = "imported"
 	ClusterDriverLocal    = "local"
 	ClusterDriverRKE      = "rancherKubernetesEngine"
+	ClusterDriverGKE      = "googleKubernetesEngine"
+	ClusterDriverEKS      = "amazonElasticContainerService"
+	ClusterDriverAKS      = "azureKubernetesService"
 )
 
 type Cluster struct {
@@ -55,17 +74,24 @@ type Cluster struct {
 }
 
 type ClusterSpec struct {
-	DisplayName                          string                               `json:"displayName"`
-	Description                          string                               `json:"description"`
-	Internal                             bool                                 `json:"internal" norman:"nocreate,noupdate"`
-	DesiredAgentImage                    string                               `json:"desiredAgentImage"`
-	ImportedConfig                       *ImportedConfig                      `json:"importedConfig,omitempty" norman:"nocreate,noupdate"`
-	GoogleKubernetesEngineConfig         *GoogleKubernetesEngineConfig        `json:"googleKubernetesEngineConfig,omitempty"`
-	AzureKubernetesServiceConfig         *AzureKubernetesServiceConfig        `json:"azureKubernetesServiceConfig,omitempty"`
-	RancherKubernetesEngineConfig        *RancherKubernetesEngineConfig       `json:"rancherKubernetesEngineConfig,omitempty"`
-	AmazonElasticContainerServiceConfig  *AmazonElasticContainerServiceConfig `json:"amazonElasticContainerServiceConfig,omitempty"`
-	DefaultPodSecurityPolicyTemplateName string                               `json:"defaultPodSecurityPolicyTemplateName,omitempty" norman:"type=reference[podSecurityPolicyTemplate]"`
-	DefaultClusterRoleForProjectMembers  string                               `json:"defaultClusterRoleForProjectMembers,omitempty" norman:"type=reference[roleTemplate]"`
+	DisplayName                          string                         `json:"displayName" norman:"required"`
+	Description                          string                         `json:"description"`
+	Internal                             bool                           `json:"internal" norman:"nocreate,noupdate"`
+	DesiredAgentImage                    string                         `json:"desiredAgentImage"`
+	DesiredAuthImage                     string                         `json:"desiredAuthImage"`
+	ImportedConfig                       *ImportedConfig                `json:"importedConfig,omitempty" norman:"nocreate,noupdate"`
+	GoogleKubernetesEngineConfig         *MapStringInterface            `json:"googleKubernetesEngineConfig,omitempty"`
+	AzureKubernetesServiceConfig         *MapStringInterface            `json:"azureKubernetesServiceConfig,omitempty"`
+	RancherKubernetesEngineConfig        *RancherKubernetesEngineConfig `json:"rancherKubernetesEngineConfig,omitempty"`
+	AmazonElasticContainerServiceConfig  *MapStringInterface            `json:"amazonElasticContainerServiceConfig,omitempty"`
+	GenericEngineConfig                  *MapStringInterface            `json:"genericEngineConfig,omitempty"`
+	DefaultPodSecurityPolicyTemplateName string                         `json:"defaultPodSecurityPolicyTemplateName,omitempty" norman:"type=reference[podSecurityPolicyTemplate]"`
+	DefaultClusterRoleForProjectMembers  string                         `json:"defaultClusterRoleForProjectMembers,omitempty" norman:"type=reference[roleTemplate]"`
+	DockerRootDir                        string                         `json:"dockerRootDir,omitempty" norman:"default=/var/lib/docker"`
+	EnableNetworkPolicy                  *bool                          `json:"enableNetworkPolicy" norman:"default=false"`
+	EnableClusterAlerting                bool                           `json:"enableClusterAlerting" norman:"default=false"`
+	EnableClusterMonitoring              bool                           `json:"enableClusterMonitoring" norman:"default=false"`
+	LocalClusterAuthEndpoint             LocalClusterAuthEndpoint       `json:"localClusterAuthEndpoint,omitempty"`
 }
 
 type ImportedConfig struct {
@@ -73,13 +99,14 @@ type ImportedConfig struct {
 }
 
 type ClusterStatus struct {
-	//Conditions represent the latest available observations of an object's current state:
-	//More info: https://github.com/kubernetes/community/blob/master/contributors/devel/api-conventions.md#typical-status-properties
+	// Conditions represent the latest available observations of an object's current state:
+	// More info: https://github.com/kubernetes/community/blob/master/contributors/devel/api-conventions.md#typical-status-properties
 	Conditions []ClusterCondition `json:"conditions,omitempty"`
-	//Component statuses will represent cluster's components (etcd/controller/scheduler) health
+	// Component statuses will represent cluster's components (etcd/controller/scheduler) health
 	// https://kubernetes.io/docs/api-reference/v1.8/#componentstatus-v1-core
 	Driver                               string                   `json:"driver"`
 	AgentImage                           string                   `json:"agentImage"`
+	AuthImage                            string                   `json:"authImage"`
 	ComponentStatuses                    []ClusterComponentStatus `json:"componentStatuses,omitempty"`
 	APIEndpoint                          string                   `json:"apiEndpoint,omitempty"`
 	ServiceAccountToken                  string                   `json:"serviceAccountToken,omitempty"`
@@ -92,6 +119,9 @@ type ClusterStatus struct {
 	Limits                               v1.ResourceList          `json:"limits,omitempty"`
 	Version                              *version.Info            `json:"version,omitempty"`
 	AppliedPodSecurityPolicyTemplateName string                   `json:"appliedPodSecurityPolicyTemplateId"`
+	AppliedEnableNetworkPolicy           bool                     `json:"appliedEnableNetworkPolicy" norman:"nocreate,noupdate,default=false"`
+	Capabilities                         Capabilities             `json:"capabilities,omitempty"`
+	MonitoringStatus                     *MonitoringStatus        `json:"monitoringStatus,omitempty" norman:"nocreate,noupdate"`
 }
 
 type ClusterComponentStatus struct {
@@ -114,98 +144,26 @@ type ClusterCondition struct {
 	Message string `json:"message,omitempty"`
 }
 
-type GoogleKubernetesEngineConfig struct {
-	// ProjectID is the ID of your project to use when creating a cluster
-	ProjectID string `json:"projectId,omitempty" norman:"required"`
-	// The zone to launch the cluster
-	Zone string `json:"zone,omitempty" norman:"required"`
-	// The IP address range of the container pods
-	ClusterIpv4Cidr string `json:"clusterIpv4Cidr,omitempty"`
-	// An optional description of this cluster
-	Description string `json:"description,omitempty"`
-	// The number of nodes in this cluster
-	NodeCount int64 `json:"nodeCount,omitempty" norman:"required"`
-	// Size of the disk attached to each node
-	DiskSizeGb int64 `json:"diskSizeGb,omitempty"`
-	// The name of a Google Compute Engine
-	MachineType string `json:"machineType,omitempty"`
-	// Node kubernetes version
-	NodeVersion string `json:"nodeVersion,omitempty"`
-	// the master kubernetes version
-	MasterVersion string `json:"masterVersion,omitempty"`
-	// The map of Kubernetes labels (key/value pairs) to be applied
-	// to each node.
-	Labels map[string]string `json:"labels,omitempty"`
-	// The content of the credential file(key.json)
-	Credential string `json:"credential,omitempty" norman:"required,type=password"`
-	// Enable alpha feature
-	EnableAlphaFeature bool `json:"enableAlphaFeature,omitempty"`
-	// Configuration for the HTTP (L7) load balancing controller addon
-	HTTPLoadBalancing bool `json:"httpLoadBalancing,omitempty"`
-	// Configuration for the horizontal pod autoscaling feature, which increases or decreases the number of replica pods a replication controller has based on the resource usage of the existing pods
-	HorizontalPodAutoscaling bool `json:"horizontalPodAutoscaling,omitempty"`
-	// Configuration for the Kubernetes Dashboard
-	KubernetesDashboard bool `json:"kubernetesDashboard,omitempty"`
-	// Configuration for NetworkPolicy
-	NetworkPolicyConfig bool `json:"networkPolicyConfig,omitempty"`
-	// The list of Google Compute Engine locations in which the cluster's nodes should be located
-	Locations []string `json:"locations,omitempty"`
-	// Image Type
-	ImageType string `json:"imageType,omitempty"`
-	// Network
-	Network string `json:"network,omitempty"`
-	// Sub Network
-	SubNetwork string `json:"subNetwork,omitempty"`
-	// Configuration for LegacyAbac
-	LegacyAbac bool `json:"legacyAbac,omitempty"`
-}
+type MapStringInterface map[string]interface{}
 
-type AzureKubernetesServiceConfig struct {
-	// Subscription credentials which uniquely identify Microsoft Azure subscription. The subscription ID forms part of the URI for every service call.
-	SubscriptionID string `json:"subscriptionId,omitempty" norman:"required"`
-	// The name of the resource group.
-	ResourceGroup string `json:"resourceGroup,omitempty" norman:"required"`
-	// Resource location
-	Location string `json:"location,omitempty"`
-	// Resource tags
-	Tag map[string]string `json:"tags,omitempty"`
-	// Number of agents (VMs) to host docker containers. Allowed values must be in the range of 1 to 100 (inclusive). The default value is 1.
-	Count int64 `json:"count,omitempty"`
-	// DNS prefix to be used to create the FQDN for the agent pool.
-	AgentDNSPrefix string `json:"agentDnsPrefix,,omitempty"`
-	// FDQN for the agent pool
-	AgentPoolName string `json:"agentPoolName,,omitempty"`
-	// OS Disk Size in GB to be used to specify the disk size for every machine in this master/agent pool. If you specify 0, it will apply the default osDisk size according to the vmSize specified.
-	OsDiskSizeGB int64 `json:"osDiskSizeGb,omitempty"`
-	// Size of agent VMs
-	AgentVMSize string `json:"agentVmSize,omitempty"`
-	// Version of Kubernetes specified when creating the managed cluster
-	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
-	// Path to the public key to use for SSH into cluster
-	SSHPublicKeyContents string `json:"sshPublicKeyContents,omitempty" norman:"required"`
-	// Kubernetes Master DNS prefix (must be unique within Azure)
-	MasterDNSPrefix string `json:"masterDnsPrefix,omitempty"`
-	// Kubernetes admin username
-	AdminUsername string `json:"adminUsername,omitempty"`
-	// Different Base URL if required, usually needed for testing purposes
-	BaseURL string `json:"baseUrl,omitempty"`
-	// Azure Client ID to use
-	ClientID string `json:"clientId,omitempty" norman:"required"`
-	// Tenant ID to create the cluster under
-	TenantID string `json:"tenantId,omitempty" norman:"required"`
-	// Secret associated with the Client ID
-	ClientSecret string `json:"clientSecret,omitempty" norman:"required,type=password"`
-}
+func (m *MapStringInterface) DeepCopy() *MapStringInterface {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	dec := gob.NewDecoder(&buf)
+	err := enc.Encode(m)
+	if err != nil {
+		logrus.Errorf("error while deep copying MapStringInterface %v", err)
+		return nil
+	}
 
-type AmazonElasticContainerServiceConfig struct {
-	AccessKey string `json:"accessKey" norman:"required"`
-	SecretKey string `json:"secretKey" norman:"required,type=password"`
-}
+	var copy MapStringInterface
+	err = dec.Decode(&copy)
+	if err != nil {
+		logrus.Errorf("error while deep copying MapStringInterface %v", err)
+		return nil
+	}
 
-type ClusterEvent struct {
-	types.Namespaced
-	v1.Event
-	ClusterName string `json:"clusterName" norman:"type=reference[cluster]"`
+	return &copy
 }
 
 type ClusterRegistrationToken struct {
@@ -228,13 +186,75 @@ type ClusterRegistrationTokenSpec struct {
 }
 
 type ClusterRegistrationTokenStatus struct {
-	InsecureCommand string `json:"insecureCommand"`
-	Command         string `json:"command"`
-	NodeCommand     string `json:"nodeCommand"`
-	ManifestURL     string `json:"manifestUrl"`
-	Token           string `json:"token"`
+	InsecureCommand    string `json:"insecureCommand"`
+	Command            string `json:"command"`
+	WindowsNodeCommand string `json:"windowsNodeCommand"`
+	NodeCommand        string `json:"nodeCommand"`
+	ManifestURL        string `json:"manifestUrl"`
+	Token              string `json:"token"`
 }
 
 type GenerateKubeConfigOutput struct {
 	Config string `json:"config"`
+}
+
+type ExportOutput struct {
+	YAMLOutput string `json:"yamlOutput"`
+}
+
+type ImportClusterYamlInput struct {
+	YAML             string `json:"yaml,omitempty"`
+	DefaultNamespace string `json:"defaultNamespace,omitempty"`
+	Namespace        string `json:"namespace,omitempty"`
+	ProjectName      string `json:"projectName,omitempty" norman:"type=reference[project]"`
+}
+
+type ImportYamlOutput struct {
+	Message string `json:"message,omitempty"`
+}
+
+type Capabilities struct {
+	LoadBalancerCapabilities LoadBalancerCapabilities `json:"loadBalancerCapabilities,omitempty"`
+	IngressCapabilities      []IngressCapabilities    `json:"ingressCapabilities,omitempty"`
+	NodePoolScalingSupported bool                     `json:"nodePoolScalingSupported,omitempty"`
+	NodePortRange            string                   `json:"nodePortRange,omitempty"`
+}
+
+type LoadBalancerCapabilities struct {
+	Enabled              *bool    `json:"enabled,omitempty"`
+	Provider             string   `json:"provider,omitempty"`
+	ProtocolsSupported   []string `json:"protocolsSupported,omitempty"`
+	HealthCheckSupported bool     `json:"healthCheckSupported,omitempty"`
+}
+
+type IngressCapabilities struct {
+	IngressProvider      string `json:"ingressProvider,omitempty"`
+	CustomDefaultBackend bool   `json:"customDefaultBackend,omitempty"`
+}
+
+type MonitoringInput struct {
+	Answers map[string]string `json:"answers,omitempty"`
+}
+
+type MonitoringOutput struct {
+	Answers map[string]string `json:"answers,omitempty"`
+}
+
+type RestoreFromEtcdBackupInput struct {
+	EtcdBackupName string `json:"etcdBackupName,omitempty" norman:"type=reference[etcdBackup]"`
+}
+
+type RotateCertificateInput struct {
+	CACertificates bool     `json:"caCertificates,omitempty"`
+	Services       []string `json:"services,omitempty" norman:"type=enum,options=etcd|kubelet|kube-apiserver|kube-proxy|kube-scheduler|kube-controller-manager"`
+}
+
+type RotateCertificateOutput struct {
+	Message string `json:"message,omitempty"`
+}
+
+type LocalClusterAuthEndpoint struct {
+	Enabled bool   `json:"enabled"`
+	FQDN    string `json:"fqdn,omitempty"`
+	CACerts string `json:"caCerts,omitempty"`
 }

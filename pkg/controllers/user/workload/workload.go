@@ -24,6 +24,7 @@ import (
 
 const (
 	creatorIDAnnotation = "field.cattle.io/creatorId"
+	metricsAnnotation   = "field.cattle.io/workloadMetrics"
 )
 
 type Controller struct {
@@ -37,7 +38,7 @@ func Register(ctx context.Context, workload *config.UserOnlyContext) {
 		serviceLister: workload.Core.Services("").Controller().Lister(),
 		services:      workload.Core.Services(""),
 	}
-	c.workloadController = NewWorkloadController(workload, c.CreateService)
+	c.workloadController = NewWorkloadController(ctx, workload, c.CreateService)
 }
 
 func getName() string {
@@ -50,7 +51,7 @@ func (c *Controller) CreateService(key string, w *Workload) error {
 		return nil
 	}
 	for _, o := range w.OwnerReferences {
-		if *o.Controller {
+		if o.Controller != nil && *o.Controller {
 			return nil
 		}
 	}
@@ -107,11 +108,25 @@ func (c *Controller) CreateServiceForWorkload(workload *Workload) error {
 			return err
 		}
 
-		if existing == nil {
+		recreate := false
+		// to handle clusterIP to headless service updates
+		// as clusterIP field is immutable
+		if existing != nil && toCreate.Type == ClusterIPServiceType {
+			clusterIPNew := toCreate.ClusterIP
+			custerIPOld := existing.Spec.ClusterIP
+			if clusterIPNew != custerIPOld && (clusterIPNew == "None" || custerIPOld == "None") {
+				err = c.services.DeleteNamespaced(existing.Namespace, existing.Name, &metav1.DeleteOptions{})
+				if err != nil {
+					return err
+				}
+				recreate = true
+			}
+		}
+
+		if existing == nil || recreate {
 			if err := c.createService(toCreate, workload); err != nil {
 				return err
 			}
-
 		} else {
 			// check if the port of the same type
 			if existing.Spec.Type != toCreate.Type {
@@ -130,9 +145,10 @@ func (c *Controller) CreateServiceForWorkload(workload *Workload) error {
 				return nil
 			}
 
-			if arePortsEqual(toCreate.ServicePorts, existing.Spec.Ports) {
+			if ArePortsEqual(toCreate.ServicePorts, existing.Spec.Ports) {
 				continue
 			}
+
 			if err := c.updateService(toCreate, existing); err != nil {
 				return err
 			}
@@ -172,24 +188,27 @@ func (c *Controller) updateService(toUpdate Service, existing *corev1.Service) e
 	for _, p := range toUpdate.ServicePorts {
 		if val, ok := existingPortNameToPort[p.Name]; ok {
 			if val.Port == p.Port {
-				// Once switch to k8s 1.9, reset only when p.Nodeport == 0. There is a bug in 1.8
-				// on port update with diff NodePort value resulting in api server crash
-				// https://github.com/kubernetes/kubernetes/issues/58892
-				//if p.NodePort == 0 {
-				//	p.NodePort = val.NodePort
-				//}
-				p.NodePort = val.NodePort
+				if p.NodePort != val.NodePort {
+					if p.NodePort == 0 {
+						// random port handling to avoid infinite updates
+						p.NodePort = val.NodePort
+					}
+				}
 			}
 		}
 		portsToUpdate = append(portsToUpdate, p)
 	}
 
 	existing.Spec.Ports = portsToUpdate
+	if existing.Spec.Type == ClusterIPServiceType && existing.Spec.ClusterIP == "None" {
+		existing.Spec.ClusterIP = toUpdate.ClusterIP
+	}
 	logrus.Infof("Updating [%s/%s] service with ports [%v]", existing.Namespace, existing.Name, portsToUpdate)
 	_, err := c.services.Update(existing)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -223,7 +242,7 @@ func (c *Controller) createService(toCreate Service, workload *Workload) error {
 	}
 
 	serviceAnnotations := map[string]string{}
-	workloadAnnotationValue, err := workloadAnnotationToString(workload.getKey())
+	workloadAnnotationValue, err := IDAnnotationToString(workload.Key)
 	if err != nil {
 		return err
 	}
@@ -247,7 +266,7 @@ func (c *Controller) createService(toCreate Service, workload *Workload) error {
 	}
 
 	logrus.Infof("Creating [%s/%s] service of type [%s] with ports [%v] for workload %s", service.Namespace, service.Name,
-		service.Spec.Type, toCreate.ServicePorts, workload.getKey())
+		service.Spec.Type, toCreate.ServicePorts, workload.Key)
 	_, err = c.services.Create(service)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
@@ -258,7 +277,7 @@ func (c *Controller) createService(toCreate Service, workload *Workload) error {
 	return nil
 }
 
-func arePortsEqual(one []corev1.ServicePort, two []corev1.ServicePort) bool {
+func ArePortsEqual(one []corev1.ServicePort, two []corev1.ServicePort) bool {
 	if len(one) != len(two) {
 		return false
 	}
@@ -266,10 +285,8 @@ func arePortsEqual(one []corev1.ServicePort, two []corev1.ServicePort) bool {
 	for _, o := range one {
 		found := false
 		for _, t := range two {
-			// Once switch to k8s 1.9, compare nodePort value as well. There is a bug in 1.8
-			// on port update with diff NodePort value resulting in api server crash
-			// https://github.com/kubernetes/kubernetes/issues/58892
-			if o.TargetPort == t.TargetPort && o.Protocol == t.Protocol && o.Port == t.Port {
+			nodePortsEqual := (o.NodePort == 0 || t.NodePort == 0) || (o.NodePort == t.NodePort)
+			if o.TargetPort == t.TargetPort && o.Protocol == t.Protocol && o.Port == t.Port && nodePortsEqual {
 				found = true
 				break
 			}
@@ -282,7 +299,7 @@ func arePortsEqual(one []corev1.ServicePort, two []corev1.ServicePort) bool {
 	return true
 }
 
-func workloadAnnotationToString(workloadID string) (string, error) {
+func IDAnnotationToString(workloadID string) (string, error) {
 	ws := []string{workloadID}
 	b, err := json.Marshal(ws)
 	if err != nil {

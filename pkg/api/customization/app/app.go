@@ -1,40 +1,91 @@
 package app
 
 import (
-	"net/http"
-	"time"
-
-	"strings"
-
 	"fmt"
-
+	"net/http"
 	"reflect"
 
 	"github.com/rancher/norman/api/access"
+	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/parse"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
+	"github.com/rancher/norman/types/values"
 	"github.com/rancher/rancher/pkg/controllers/management/compose/common"
+	hcommon "github.com/rancher/rancher/pkg/controllers/user/helm/common"
 	"github.com/rancher/rancher/pkg/ref"
+	clusterschema "github.com/rancher/types/apis/cluster.cattle.io/v3/schema"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
+	pv3 "github.com/rancher/types/apis/project.cattle.io/v3"
 	projectschema "github.com/rancher/types/apis/project.cattle.io/v3/schema"
+	clusterv3 "github.com/rancher/types/client/cluster/v3"
 	projectv3 "github.com/rancher/types/client/project/v3"
+	"github.com/rancher/types/user"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type Wrapper struct {
 	Clusters              v3.ClusterInterface
+	TemplateVersionClient v3.CatalogTemplateVersionInterface
 	KubeConfigGetter      common.KubeConfigGetter
-	TemplateContentClient v3.TemplateContentInterface
+	AppGetter             pv3.AppsGetter
+	UserLister            v3.UserLister
+	UserManager           user.Manager
 }
 
-const appLabel = "io.cattle.field/appId"
+const (
+	appLabel      = "io.cattle.field/appId"
+	MCappLabel    = "mcapp"
+	creatorIDAnno = "field.cattle.io/creatorId"
+)
 
 func Formatter(apiContext *types.APIContext, resource *types.RawResource) {
-	resource.AddAction(apiContext, "upgrade")
-	resource.AddAction(apiContext, "rollback")
-	resource.Links["export"] = apiContext.URLBuilder.Link("export", resource)
+	mcappLabel := convert.ToString(values.GetValueN(resource.Values, "labels", MCappLabel))
+	if mcappLabel == "" {
+		resource.AddAction(apiContext, "upgrade")
+		resource.AddAction(apiContext, "rollback")
+	} else {
+		delete(resource.Links, "remove")
+	}
 	resource.Links["revision"] = apiContext.URLBuilder.Link("revision", resource)
+	if _, ok := resource.Values["status"]; ok {
+		if status, ok := resource.Values["status"].(map[string]interface{}); ok {
+			delete(status, "lastAppliedTemplate")
+		}
+	}
+	delete(resource.Values, "appliedFiles")
+	delete(resource.Values, "files")
+}
+
+func (w Wrapper) Validator(request *types.APIContext, schema *types.Schema, data map[string]interface{}) error {
+	externalID := convert.ToString(data["externalId"])
+	if externalID == "" {
+		return nil
+	}
+	templateVersionID, templateVersionNamespace, err := hcommon.ParseExternalID(externalID)
+	if err != nil {
+		return err
+	}
+	templateVersion, err := w.TemplateVersionClient.GetNamespaced(templateVersionNamespace, templateVersionID, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	targetNamespace := convert.ToString(data["targetNamespace"])
+	if templateVersion.Spec.RequiredNamespace != "" && templateVersion.Spec.RequiredNamespace != targetNamespace {
+		return httperror.NewAPIError(httperror.InvalidType, "template's requiredNamespace doesn't match catalog app's target namespace")
+	}
+
+	// in here access.ByID will only find namespace that is assigned to the current project
+	var ns clusterv3.Namespace
+	if err := access.ByID(request, &clusterschema.Version, clusterv3.NamespaceType, targetNamespace, &ns); err != nil {
+		return err
+	}
+	if ns.Name == "" {
+		return httperror.NewAPIError(httperror.InvalidReference, fmt.Sprintf("target namespace %v is not assigned to the current project %v", targetNamespace, data["projectId"]))
+	}
+
+	return nil
 }
 
 func (w Wrapper) ActionHandler(actionName string, action *types.Action, apiContext *types.APIContext) error {
@@ -42,82 +93,108 @@ func (w Wrapper) ActionHandler(actionName string, action *types.Action, apiConte
 	if err := access.ByID(apiContext, &projectschema.Version, projectv3.AppType, apiContext.ID, &app); err != nil {
 		return err
 	}
+
+	creatorNotFound := false
+	if _, err := w.UserLister.Get("", app.CreatorID); err != nil && apierrors.IsNotFound(err) {
+		creatorNotFound = true
+	}
+	userCanCreateApp := apiContext.AccessControl.CanCreate(apiContext, apiContext.Schema) == nil
+
+	if creatorNotFound && !userCanCreateApp {
+		return httperror.NewAPIError(httperror.PermissionDenied, "can not upgrade/rollback app")
+	}
+
 	actionInput, err := parse.ReadBody(apiContext.Request)
 	if err != nil {
 		return err
 	}
-	store := apiContext.Schema.Store
 	switch actionName {
 	case "upgrade":
 		externalID := actionInput["externalId"]
 		answers := actionInput["answers"]
+		forceUpgrade := actionInput["forceUpgrade"]
+		files := actionInput["files"]
+		valuesYaml := actionInput["valuesYaml"]
+		_, namespace := ref.Parse(app.ProjectID)
+		obj, err := w.AppGetter.Apps(namespace).Get(app.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
 		if answers != nil {
 			m, ok := answers.(map[string]interface{})
 			if ok {
-				if app.Answers == nil {
-					app.Answers = make(map[string]string)
-				}
+				obj.Spec.Answers = make(map[string]string)
 				for k, v := range m {
-					app.Answers[k] = convert.ToString(v)
+					obj.Spec.Answers[k] = convert.ToString(v)
 				}
 			}
 		}
-		app.ExternalID = convert.ToString(externalID)
-		data, err := convert.EncodeToMap(app)
-		if err != nil {
+		obj.Spec.ExternalID = convert.ToString(externalID)
+		if convert.ToBool(forceUpgrade) {
+			pv3.AppConditionForceUpgrade.Unknown(obj)
+		}
+		if creatorNotFound {
+			obj.Annotations[creatorIDAnno] = w.UserManager.GetUser(apiContext)
+		}
+		if files != nil {
+			inputFiles := convert.ToMapInterface(files)
+			if len(inputFiles) != 0 {
+				targetFiles := make(map[string]string)
+				for k, v := range inputFiles {
+					targetFiles[k] = convert.ToString(v)
+				}
+
+				obj.Spec.Files = targetFiles
+				obj.Spec.ExternalID = "" // ignore externalID
+			}
+		}
+		if valuesYaml != nil {
+			obj.Spec.ValuesYaml = convert.ToString(valuesYaml)
+		}
+
+		if _, err := w.AppGetter.Apps(namespace).Update(obj); err != nil {
 			return err
 		}
-		_, err = store.Update(apiContext, apiContext.Schema, data, apiContext.ID)
-		if err != nil {
-			return err
-		}
+		apiContext.WriteResponse(http.StatusNoContent, map[string]interface{}{})
 		return nil
 	case "rollback":
-		revision := actionInput["revision"]
-		if convert.ToString(revision) == "" {
+		forceUpgrade := actionInput["forceUpgrade"]
+		revisionName := convert.ToString(actionInput["revisionId"])
+		if revisionName == "" {
 			return fmt.Errorf("revision is empty")
 		}
+		_, projectID := ref.Parse(app.ProjectID)
+		revisionID := fmt.Sprintf("%s:%s", projectID, revisionName)
 		var appRevision projectv3.AppRevision
-		_, projectID := ref.Parse(app.ProjectId)
-		revisionID := fmt.Sprintf("%s:%s", projectID, convert.ToString(revision))
 		if err := access.ByID(apiContext, &projectschema.Version, projectv3.AppRevisionType, revisionID, &appRevision); err != nil {
 			return err
 		}
-		app.Answers = appRevision.Status.Answers
-		app.ExternalID = appRevision.Status.ExternalID
-		data, err := convert.EncodeToMap(app)
+		_, namespace := ref.Parse(app.ProjectID)
+		obj, err := w.AppGetter.Apps(namespace).Get(app.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
-		_, err = store.Update(apiContext, apiContext.Schema, data, apiContext.ID)
-		if err != nil {
+		obj.Spec.Answers = appRevision.Status.Answers
+		obj.Spec.ExternalID = appRevision.Status.ExternalID
+		if convert.ToBool(forceUpgrade) {
+			pv3.AppConditionForceUpgrade.Unknown(obj)
+		}
+		if creatorNotFound {
+			obj.Annotations[creatorIDAnno] = w.UserManager.GetUser(apiContext)
+		}
+		obj.Spec.Files = appRevision.Status.Files
+
+		if _, err := w.AppGetter.Apps(namespace).Update(obj); err != nil {
 			return err
 		}
+		apiContext.WriteResponse(http.StatusNoContent, map[string]interface{}{})
+		return nil
 	}
 	return nil
 }
 
 func (w Wrapper) LinkHandler(apiContext *types.APIContext, next types.RequestHandler) error {
 	switch apiContext.Link {
-	case "export":
-		var app projectv3.App
-		if err := access.ByID(apiContext, &projectschema.Version, projectv3.AppType, apiContext.ID, &app); err != nil {
-			return err
-		}
-		var appRevision projectv3.AppRevision
-		_, projectID := ref.Parse(app.ProjectId)
-		revisionID := fmt.Sprintf("%s:%s", projectID, app.AppRevisionId)
-		if err := access.ByID(apiContext, &projectschema.Version, projectv3.AppRevisionType, revisionID, &appRevision); err != nil {
-			return err
-		}
-		tc, err := w.TemplateContentClient.Get(appRevision.Status.Digest, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		reader := strings.NewReader(tc.Data)
-		apiContext.Response.Header().Set("Content-Type", "text/plain")
-		http.ServeContent(apiContext.Response, apiContext.Request, "readme", time.Now(), reader)
-		return nil
 	case "revision":
 		var app projectv3.App
 		if err := access.ByID(apiContext, &projectschema.Version, projectv3.AppType, apiContext.ID, &app); err != nil {

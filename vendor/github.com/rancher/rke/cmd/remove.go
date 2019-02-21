@@ -8,8 +8,8 @@ import (
 	"strings"
 
 	"github.com/rancher/rke/cluster"
+	"github.com/rancher/rke/dind"
 	"github.com/rancher/rke/hosts"
-	"github.com/rancher/rke/k8s"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/pki"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
@@ -31,11 +31,15 @@ func RemoveCommand() cli.Command {
 		},
 		cli.BoolFlag{
 			Name:  "local",
-			Usage: "Deploy Kubernetes cluster locally",
+			Usage: "Remove Kubernetes cluster locally",
+		},
+		cli.BoolFlag{
+			Name:  "dind",
+			Usage: "Remove Kubernetes cluster deployed in dind mode",
 		},
 	}
 
-	removeFlags = append(removeFlags, sshCliOptions...)
+	removeFlags = append(removeFlags, commonFlags...)
 
 	return cli.Command{
 		Name:   "remove",
@@ -48,17 +52,19 @@ func RemoveCommand() cli.Command {
 func ClusterRemove(
 	ctx context.Context,
 	rkeConfig *v3.RancherKubernetesEngineConfig,
-	dialerFactory hosts.DialerFactory,
-	k8sWrapTransport k8s.WrapTransport,
-	local bool, configDir string) error {
+	dialersOptions hosts.DialersOptions,
+	flags cluster.ExternalFlags) error {
 
 	log.Infof(ctx, "Tearing down Kubernetes cluster")
-	kubeCluster, err := cluster.ParseCluster(ctx, rkeConfig, clusterFilePath, configDir, dialerFactory, nil, k8sWrapTransport)
+	kubeCluster, err := cluster.InitClusterObject(ctx, rkeConfig, flags)
 	if err != nil {
 		return err
 	}
+	if err := kubeCluster.SetupDialers(ctx, dialersOptions); err != nil {
+		return err
+	}
 
-	err = kubeCluster.TunnelHosts(ctx, local)
+	err = kubeCluster.TunnelHosts(ctx, flags)
 	if err != nil {
 		return err
 	}
@@ -74,6 +80,13 @@ func ClusterRemove(
 }
 
 func clusterRemoveFromCli(ctx *cli.Context) error {
+	if ctx.Bool("local") {
+		return clusterRemoveLocal(ctx)
+	}
+	clusterFile, filePath, err := resolveClusterFile(ctx)
+	if err != nil {
+		return fmt.Errorf("Failed to resolve cluster file: %v", err)
+	}
 	force := ctx.Bool("force")
 	if !force {
 		reader := bufio.NewReader(os.Stdin)
@@ -87,14 +100,9 @@ func clusterRemoveFromCli(ctx *cli.Context) error {
 			return nil
 		}
 	}
-	if ctx.Bool("local") {
-		return clusterRemoveLocal(ctx)
+	if ctx.Bool("dind") {
+		return clusterRemoveDind(ctx)
 	}
-	clusterFile, filePath, err := resolveClusterFile(ctx)
-	if err != nil {
-		return fmt.Errorf("Failed to resolve cluster file: %v", err)
-	}
-	clusterFilePath = filePath
 	rkeConfig, err := cluster.ParseConfig(clusterFile)
 	if err != nil {
 		return fmt.Errorf("Failed to parse cluster file: %v", err)
@@ -105,17 +113,19 @@ func clusterRemoveFromCli(ctx *cli.Context) error {
 		return err
 	}
 
-	return ClusterRemove(context.Background(), rkeConfig, nil, nil, false, "")
+	// setting up the flags
+	flags := cluster.GetExternalFlags(false, false, false, "", filePath)
+
+	return ClusterRemove(context.Background(), rkeConfig, hosts.DialersOptions{}, flags)
 }
 
 func clusterRemoveLocal(ctx *cli.Context) error {
 	var rkeConfig *v3.RancherKubernetesEngineConfig
 	clusterFile, filePath, err := resolveClusterFile(ctx)
 	if err != nil {
-		log.Infof(context.Background(), "Failed to resolve cluster file, using default cluster instead")
+		log.Warnf(context.Background(), "Failed to resolve cluster file, using default cluster instead")
 		rkeConfig = cluster.GetLocalRKEConfig()
 	} else {
-		clusterFilePath = filePath
 		rkeConfig, err = cluster.ParseConfig(clusterFile)
 		if err != nil {
 			return fmt.Errorf("Failed to parse cluster file: %v", err)
@@ -127,6 +137,35 @@ func clusterRemoveLocal(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	// setting up the flags
+	flags := cluster.GetExternalFlags(true, false, false, "", filePath)
 
-	return ClusterRemove(context.Background(), rkeConfig, nil, nil, true, "")
+	return ClusterRemove(context.Background(), rkeConfig, hosts.DialersOptions{}, flags)
+}
+
+func clusterRemoveDind(ctx *cli.Context) error {
+	clusterFile, filePath, err := resolveClusterFile(ctx)
+	if err != nil {
+		return fmt.Errorf("Failed to resolve cluster file: %v", err)
+	}
+
+	rkeConfig, err := cluster.ParseConfig(clusterFile)
+	if err != nil {
+		return fmt.Errorf("Failed to parse cluster file: %v", err)
+	}
+
+	rkeConfig, err = setOptionsFromCLI(ctx, rkeConfig)
+	if err != nil {
+		return err
+	}
+
+	for _, node := range rkeConfig.Nodes {
+		if err = dind.RmoveDindContainer(context.Background(), node.Address); err != nil {
+			return err
+		}
+	}
+	localKubeConfigPath := pki.GetLocalKubeConfig(filePath, "")
+	// remove the kube config file
+	pki.RemoveAdminConfig(context.Background(), localKubeConfigPath)
+	return err
 }

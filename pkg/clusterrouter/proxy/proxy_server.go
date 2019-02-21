@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,7 +21,7 @@ type RemoteService struct {
 	cluster   *v3.Cluster
 	transport http.RoundTripper
 	url       urlGetter
-	auth      string
+	auth      authGetter
 }
 
 var (
@@ -28,6 +29,8 @@ var (
 )
 
 type urlGetter func() (url.URL, error)
+
+type authGetter func() (string, error)
 
 type errorResponder struct {
 }
@@ -60,13 +63,22 @@ func NewLocal(localConfig *rest.Config, cluster *v3.Cluster) (*RemoteService, er
 		return nil, err
 	}
 
-	return &RemoteService{
+	rs := &RemoteService{
 		cluster: cluster,
 		url: func() (url.URL, error) {
 			return *hostURL, nil
 		},
 		transport: transport,
-	}, nil
+	}
+	if localConfig.BearerToken != "" {
+		rs.auth = func() (string, error) { return "Bearer " + localConfig.BearerToken, nil }
+	} else if localConfig.Password != "" {
+		rs.auth = func() (string, error) {
+			return "Basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", localConfig.Username, localConfig.Password))), nil
+		}
+	}
+
+	return rs, nil
 }
 
 func NewRemote(cluster *v3.Cluster, clusterLister v3.ClusterLister, factory dialer.Factory) (*RemoteService, error) {
@@ -109,11 +121,20 @@ func NewRemote(cluster *v3.Cluster, clusterLister v3.ClusterLister, factory dial
 		return *u, nil
 	}
 
+	authGetter := func() (string, error) {
+		newCluster, err := clusterLister.Get("", cluster.Name)
+		if err != nil {
+			return "", err
+		}
+
+		return "Bearer " + newCluster.Status.ServiceAccountToken, nil
+	}
+
 	return &RemoteService{
 		cluster:   cluster,
 		transport: transport,
 		url:       urlGetter,
-		auth:      "Bearer " + cluster.Status.ServiceAccountToken,
+		auth:      authGetter,
 	}, nil
 }
 
@@ -144,8 +165,15 @@ func (r *RemoteService) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	req.URL.Host = req.Host
-	if r.auth != "" {
-		req.Header.Set("Authorization", r.auth)
+	if r.auth == nil {
+		req.Header.Del("Authorization")
+	} else {
+		token, err := r.auth()
+		if err != nil {
+			er.Error(rw, req, err)
+			return
+		}
+		req.Header.Set("Authorization", token)
 	}
 
 	httpProxy := proxy.NewUpgradeAwareHandler(&u, r.transport, true, false, er)
@@ -157,11 +185,12 @@ func (r *RemoteService) Cluster() *v3.Cluster {
 }
 
 type SimpleProxy struct {
-	url       *url.URL
-	transport http.RoundTripper
+	url                *url.URL
+	transport          http.RoundTripper
+	overrideHostHeader bool
 }
 
-func NewSimpleProxy(host string, caData []byte) (*SimpleProxy, error) {
+func NewSimpleProxy(host string, caData []byte, overrideHostHeader bool) (*SimpleProxy, error) {
 	hostURL, _, err := rest.DefaultServerURL(host, "", schema.GroupVersion{}, true)
 	if err != nil {
 		return nil, err
@@ -177,8 +206,9 @@ func NewSimpleProxy(host string, caData []byte) (*SimpleProxy, error) {
 	}
 
 	return &SimpleProxy{
-		url:       hostURL,
-		transport: ht,
+		url:                hostURL,
+		transport:          ht,
+		overrideHostHeader: overrideHostHeader,
 	}, nil
 }
 
@@ -188,6 +218,9 @@ func (s *SimpleProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	u.RawQuery = req.URL.RawQuery
 	req.URL.Scheme = "https"
 	req.URL.Host = req.Host
+	if s.overrideHostHeader {
+		req.Host = u.Host
+	}
 	httpProxy := proxy.NewUpgradeAwareHandler(&u, s.transport, true, false, er)
 	httpProxy.ServeHTTP(rw, req)
 

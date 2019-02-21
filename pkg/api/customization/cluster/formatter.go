@@ -1,20 +1,20 @@
-package clusteregistrationtokens
+package cluster
 
 import (
-	"net/http"
 	"strings"
 
-	"github.com/rancher/norman/api/access"
-	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/kubeconfig"
+	"github.com/rancher/norman/types/values"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
-	managementv3 "github.com/rancher/types/client/management/v3"
-	"github.com/rancher/types/user"
+	"github.com/sirupsen/logrus"
 )
 
-func Formatter(request *types.APIContext, resource *types.RawResource) {
+type Formatter struct {
+	KontainerDriverLister v3.KontainerDriverLister
+}
+
+func (f *Formatter) Formatter(request *types.APIContext, resource *types.RawResource) {
 	if convert.ToBool(resource.Values["internal"]) {
 		delete(resource.Links, "remove")
 	}
@@ -23,36 +23,63 @@ func Formatter(request *types.APIContext, resource *types.RawResource) {
 	shellLink = strings.Replace(shellLink, "/shell", "?shell=true", 1)
 	resource.Links["shell"] = shellLink
 	resource.AddAction(request, "generateKubeconfig")
+	resource.AddAction(request, "importYaml")
+	resource.AddAction(request, "exportYaml")
+	if _, ok := resource.Values["rancherKubernetesEngineConfig"]; ok {
+		resource.AddAction(request, "rotateCertificates")
+		if _, ok := values.GetValue(resource.Values, "rancherKubernetesEngineConfig", "services", "etcd", "backupConfig"); ok {
+			resource.AddAction(request, "backupEtcd")
+			resource.AddAction(request, "restoreFromEtcdBackup")
+		}
+	}
+
+	if err := request.AccessControl.CanDo(v3.ClusterGroupVersionKind.Group, v3.ClusterResource.Name, "update", request, resource.Values, request.Schema); err == nil {
+		if convert.ToBool(resource.Values["enableClusterMonitoring"]) {
+			resource.AddAction(request, "disableMonitoring")
+			resource.AddAction(request, "editMonitoring")
+		} else {
+			resource.AddAction(request, "enableMonitoring")
+		}
+	}
+
+	if convert.ToBool(resource.Values["enableClusterMonitoring"]) {
+		resource.AddAction(request, "viewMonitoring")
+	}
+
+	if gkeConfig, ok := resource.Values["googleKubernetesEngineConfig"]; ok {
+		configMap, ok := gkeConfig.(map[string]interface{})
+		if !ok {
+			logrus.Errorf("could not convert gke config to map")
+			return
+		}
+
+		setTrueIfNil(configMap, "enableStackdriverLogging")
+		setTrueIfNil(configMap, "enableStackdriverMonitoring")
+		setTrueIfNil(configMap, "enableHorizontalPodAutoscaling")
+		setTrueIfNil(configMap, "enableHttpLoadBalancing")
+		setTrueIfNil(configMap, "enableNetworkPolicyConfig")
+	}
+
+	if eksConfig, ok := resource.Values["amazonElasticContainerServiceConfig"]; ok {
+		configMap, ok := eksConfig.(map[string]interface{})
+		if !ok {
+			logrus.Errorf("could not convert eks config to map")
+			return
+		}
+
+		setTrueIfNil(configMap, "associateWorkerNodePublicIp")
+		setIntIfNil(configMap, "nodeVolumeSize", 20)
+	}
 }
 
-type ActionHandler struct {
-	ClusterClient v3.ClusterInterface
-	UserMgr       user.Manager
+func setTrueIfNil(configMap map[string]interface{}, fieldName string) {
+	if configMap[fieldName] == nil {
+		configMap[fieldName] = true
+	}
 }
 
-func (a ActionHandler) GenerateKubeconfigActionHandler(actionName string, action *types.Action, apiContext *types.APIContext) error {
-	if actionName != "generateKubeconfig" {
-		return httperror.NewAPIError(httperror.NotFound, "not found")
+func setIntIfNil(configMap map[string]interface{}, fieldName string, replaceVal int) {
+	if configMap[fieldName] == nil {
+		configMap[fieldName] = replaceVal
 	}
-
-	var cluster managementv3.Cluster
-	if err := access.ByID(apiContext, apiContext.Version, apiContext.Type, apiContext.ID, &cluster); err != nil {
-		return err
-	}
-
-	userName := a.UserMgr.GetUser(apiContext)
-	token, err := a.UserMgr.EnsureToken("kubeconfig-"+userName, "Kubeconfig token", userName)
-	if err != nil {
-		return err
-	}
-	cfg, err := kubeconfig.ForTokenBased(cluster.Name, apiContext.ID, apiContext.Request.Host, userName, token)
-	if err != nil {
-		return err
-	}
-	data := map[string]interface{}{
-		"config": cfg,
-		"type":   "generateKubeconfigOutput",
-	}
-	apiContext.WriteResponse(http.StatusOK, data)
-	return nil
 }

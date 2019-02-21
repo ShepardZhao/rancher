@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/rancher/norman/types/slice"
-	"github.com/rancher/rancher/pkg/controllers/user/authz"
+	"github.com/rancher/rancher/pkg/controllers/user/rbac"
 	authzv1 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
 	"gopkg.in/check.v1"
@@ -50,7 +50,7 @@ func (s *AuthzSuite) TestClusterRoleTemplateBindingCreate(c *check.C) {
 	// create RoleTemplate that will reference the first one
 	rtName := "testcrt1"
 	s.clusterClient.RbacV1().ClusterRoles().Delete(rtName, &metav1.DeleteOptions{})
-	rt, err := s.createRoleTemplate(rtName,
+	rt, _ := s.createRoleTemplate(rtName,
 		[]rbacv1.PolicyRule{
 			{
 				Verbs:           []string{"get", "list", "watch"},
@@ -147,7 +147,7 @@ func (s *AuthzSuite) TestRoleTemplateBindingCreate(c *check.C) {
 	// create RoleTemplate that will reference the first one
 	rtName := "testrt1"
 	s.clusterClient.RbacV1().ClusterRoles().Delete(rtName, &metav1.DeleteOptions{})
-	rt, err := s.createRoleTemplate(rtName,
+	rt, _ := s.createRoleTemplate(rtName,
 		[]rbacv1.PolicyRule{
 			{
 				Verbs:           []string{"get", "list", "watch"},
@@ -230,7 +230,7 @@ func (s *AuthzSuite) TestBuiltinRoleTemplateBindingCreate(c *check.C) {
 
 	// create RoleTemplate that user will be bound to
 	rtName := "testrt2"
-	_, err := s.createRoleTemplate(rtName,
+	s.createRoleTemplate(rtName,
 		[]rbacv1.PolicyRule{}, []string{}, true, c)
 
 	// create namespace and watchers for resources in that namespace
@@ -291,7 +291,7 @@ func (s *AuthzSuite) createCRTBinding(bindingName string, subject rbacv1.Subject
 		ObjectMeta: metav1.ObjectMeta{
 			Name: bindingName,
 		},
-		Subject:          subject,
+		UserName:         subject.Name,
 		RoleTemplateName: rtName,
 	})
 
@@ -309,7 +309,7 @@ func (s *AuthzSuite) createPRTBinding(bindingName string, subject rbacv1.Subject
 		ObjectMeta: metav1.ObjectMeta{
 			Name: bindingName,
 		},
-		Subject:          subject,
+		UserName:         subject.Name,
 		ProjectName:      projectName,
 		RoleTemplateName: rtName,
 	})
@@ -388,9 +388,11 @@ func (s *AuthzSuite) SetUpSuite(c *check.C) {
 	s.ctx = workload
 	s.setupCRDs(c)
 
-	authz.Register(workload)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	ctx := context.Background()
+	rbac.Register(ctx, workload)
+
 	err := workload.Start(ctx)
 	c.Assert(err, check.IsNil)
 	err = workload.Management.Start(ctx)

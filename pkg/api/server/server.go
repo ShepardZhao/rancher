@@ -4,12 +4,16 @@ import (
 	"context"
 	"net/http"
 
-	normanapi "github.com/rancher/norman/api"
 	"github.com/rancher/norman/api/builtin"
 	"github.com/rancher/norman/pkg/subscribe"
+	rancherapi "github.com/rancher/rancher/pkg/api"
+	"github.com/rancher/rancher/pkg/api/controllers/catalog"
 	"github.com/rancher/rancher/pkg/api/controllers/dynamicschema"
+	"github.com/rancher/rancher/pkg/api/controllers/samlconfig"
 	"github.com/rancher/rancher/pkg/api/controllers/settings"
-	"github.com/rancher/rancher/pkg/api/controllers/whitelistproxy"
+	"github.com/rancher/rancher/pkg/api/controllers/usercontrollers"
+	whitelistproxyKontainerDriver "github.com/rancher/rancher/pkg/api/controllers/whitelistproxy/kontainerdriver"
+	whitelistproxyNodeDriver "github.com/rancher/rancher/pkg/api/controllers/whitelistproxy/nodedriver"
 	"github.com/rancher/rancher/pkg/api/server/managementstored"
 	"github.com/rancher/rancher/pkg/api/server/userstored"
 	"github.com/rancher/rancher/pkg/clustermanager"
@@ -34,16 +38,19 @@ func New(ctx context.Context, scaledContext *config.ScaledContext, clusterManage
 		return nil, err
 	}
 
-	server := normanapi.NewAPIServer()
-	server.AccessControl = scaledContext.AccessControl
-
-	if err := server.AddSchemas(scaledContext.Schemas); err != nil {
+	server, err := rancherapi.NewServer(scaledContext.Schemas)
+	if err != nil {
 		return nil, err
 	}
+	server.AccessControl = scaledContext.AccessControl
 
-	dynamicschema.Register(scaledContext, server.Schemas)
-	whitelistproxy.Register(scaledContext)
-	err := settings.Register(scaledContext)
+	catalog.Register(ctx, scaledContext)
+	dynamicschema.Register(ctx, scaledContext, server.Schemas)
+	whitelistproxyNodeDriver.Register(ctx, scaledContext)
+	whitelistproxyKontainerDriver.Register(ctx, scaledContext)
+	samlconfig.Register(ctx, scaledContext)
+	usercontrollers.Register(ctx, scaledContext, clusterManager)
+	err = settings.Register(scaledContext)
 
 	return server, err
 }

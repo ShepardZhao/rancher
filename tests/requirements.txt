@@ -1,12 +1,13 @@
-cattle==0.5.3
-git+https://github.com/ibuildthecloud/gdapi-python.git@5d2e8addde38b24533c434c348d778439f87b122
-websocket-client==0.23.0
-PyJWT==1.4.0
+git+https://github.com/rancher/client-python.git@e3762d5e63e7f9c6ef327e967b876c06dbf43949
+websocket-client==0.53.0
+PyJWT==1.6.4
 
-flake8==2.5.1
-pytest==3.0.2
-pytest-repeat
-pytest-xdist
-pyyaml
-netaddr
-requests
+flake8==3.5.0
+pytest==3.8
+pytest-repeat==0.7.0
+pytest-xdist==1.23.0
+pyyaml==3.13
+netaddr==0.7.19
+requests==2.20.0
+kubernetes==7.0.0
+jinja2==2.10

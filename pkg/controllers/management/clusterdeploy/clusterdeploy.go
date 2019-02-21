@@ -2,12 +2,15 @@ package clusterdeploy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/rancher/norman/types"
 	"github.com/rancher/rancher/pkg/clustermanager"
+	"github.com/rancher/rancher/pkg/image"
 	"github.com/rancher/rancher/pkg/kubectl"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rancher/pkg/systemaccount"
@@ -15,19 +18,22 @@ import (
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
 	"github.com/rancher/types/user"
+	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
-func Register(management *config.ManagementContext, clusterManager *clustermanager.Manager) {
+func Register(ctx context.Context, management *config.ManagementContext, clusterManager *clustermanager.Manager) {
 	c := &clusterDeploy{
 		systemAccountManager: systemaccount.NewManager(management),
 		userManager:          management.UserManager,
 		clusters:             management.Management.Clusters(""),
+		nodeLister:           management.Management.Nodes("").Controller().Lister(),
 		clusterManager:       clusterManager,
 	}
 
-	management.Management.Clusters("").AddHandler("cluster-deploy", c.sync)
+	management.Management.Clusters("").AddHandler(ctx, "cluster-deploy", c.sync)
 }
 
 type clusterDeploy struct {
@@ -35,19 +41,28 @@ type clusterDeploy struct {
 	userManager          user.Manager
 	clusters             v3.ClusterInterface
 	clusterManager       *clustermanager.Manager
+	nodeLister           v3.NodeLister
 }
 
-func (cd *clusterDeploy) sync(key string, cluster *v3.Cluster) error {
+func (cd *clusterDeploy) sync(key string, cluster *v3.Cluster) (runtime.Object, error) {
 	var (
 		err, updateErr error
 	)
 
 	if key == "" || cluster == nil {
-		return nil
+		return nil, nil
 	}
 
 	original := cluster
 	cluster = original.DeepCopy()
+
+	if cluster.Status.Driver == v3.ClusterDriverRKE {
+		if cluster.Spec.LocalClusterAuthEndpoint.Enabled {
+			cluster.Spec.RancherKubernetesEngineConfig.Authentication.Strategy = "x509|webhook"
+		} else {
+			cluster.Spec.RancherKubernetesEngineConfig.Authentication.Strategy = "x509"
+		}
+	}
 
 	err = cd.doSync(cluster)
 	if cluster != nil && !reflect.DeepEqual(cluster, original) {
@@ -55,9 +70,9 @@ func (cd *clusterDeploy) sync(key string, cluster *v3.Cluster) error {
 	}
 
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return updateErr
+	return nil, updateErr
 }
 
 func (cd *clusterDeploy) doSync(cluster *v3.Cluster) error {
@@ -65,27 +80,43 @@ func (cd *clusterDeploy) doSync(cluster *v3.Cluster) error {
 		return nil
 	}
 
-	if cluster.Spec.Internal && cluster.Status.Driver == v3.ClusterDriverImported {
+	nodes, err := cd.nodeLister.List(cluster.Name, labels.Everything())
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
 		return nil
 	}
 
-	_, err := v3.ClusterConditionSystemAccountCreated.DoUntilTrue(cluster, func() (runtime.Object, error) {
+	_, err = v3.ClusterConditionSystemAccountCreated.DoUntilTrue(cluster, func() (runtime.Object, error) {
 		return cluster, cd.systemAccountManager.CreateSystemAccount(cluster)
 	})
 	if err != nil {
 		return err
 	}
+	err = cd.deployAgent(cluster)
+	if err != nil {
+		return err
+	}
 
-	return cd.deployAgent(cluster)
+	return cd.setNetworkPolicyAnn(cluster)
 }
 
 func (cd *clusterDeploy) deployAgent(cluster *v3.Cluster) error {
-	desired := cluster.Spec.DesiredAgentImage
-	if desired == "" || desired == "fixed" {
-		desired = settings.AgentImage.Get()
+	desiredAgent := cluster.Spec.DesiredAgentImage
+	if desiredAgent == "" || desiredAgent == "fixed" {
+		desiredAgent = image.Resolve(settings.AgentImage.Get())
 	}
 
-	if cluster.Status.AgentImage == desired {
+	var desiredAuth string
+	if cluster.Spec.LocalClusterAuthEndpoint.Enabled {
+		desiredAuth = cluster.Spec.DesiredAuthImage
+		if desiredAuth == "" || desiredAuth == "fixed" {
+			desiredAuth = image.Resolve(settings.AuthImage.Get())
+		}
+	}
+
+	if cluster.Status.AgentImage == desiredAgent && cluster.Status.AuthImage == desiredAuth {
 		return nil
 	}
 
@@ -95,12 +126,27 @@ func (cd *clusterDeploy) deployAgent(cluster *v3.Cluster) error {
 	}
 
 	_, err = v3.ClusterConditionAgentDeployed.Do(cluster, func() (runtime.Object, error) {
-		yaml, err := cd.getYAML(cluster, desired)
+		yaml, err := cd.getYAML(cluster, desiredAgent, desiredAuth)
 		if err != nil {
 			return cluster, err
 		}
-
-		output, err := kubectl.Apply(yaml, kubeConfig)
+		var output []byte
+		for i := 0; i < 3; i++ {
+			// This will fail almost always the first time because when we create the namespace in the file
+			// it won't have privileges.  Just stupidly try 3 times
+			output, err = kubectl.Apply(yaml, kubeConfig)
+			if err == nil {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if err != nil {
+			return cluster, types.NewErrors(err, errors.New(string(output)))
+		}
+		v3.ClusterConditionAgentDeployed.Message(cluster, string(output))
+		if !cluster.Spec.LocalClusterAuthEndpoint.Enabled && cluster.Status.AppliedSpec.LocalClusterAuthEndpoint.Enabled && cluster.Status.AuthImage != "" {
+			output, err = kubectl.Delete([]byte(systemtemplate.AuthDaemonSet), kubeConfig)
+		}
 		if err != nil {
 			return cluster, types.NewErrors(err, errors.New(string(output)))
 		}
@@ -112,13 +158,31 @@ func (cd *clusterDeploy) deployAgent(cluster *v3.Cluster) error {
 	}
 
 	if err == nil {
-		cluster.Status.AgentImage = desired
+		cluster.Status.AgentImage = desiredAgent
 		if cluster.Spec.DesiredAgentImage == "fixed" {
-			cluster.Spec.DesiredAgentImage = desired
+			cluster.Spec.DesiredAgentImage = desiredAgent
+		}
+		cluster.Status.AuthImage = desiredAuth
+		if cluster.Spec.DesiredAuthImage == "fixed" {
+			cluster.Spec.DesiredAuthImage = desiredAuth
 		}
 	}
 
 	return err
+}
+
+func (cd *clusterDeploy) setNetworkPolicyAnn(cluster *v3.Cluster) error {
+	if cluster.Spec.EnableNetworkPolicy != nil {
+		return nil
+	}
+	// set current state for upgraded canal clusters
+	if cluster.Spec.RancherKubernetesEngineConfig != nil &&
+		cluster.Spec.RancherKubernetesEngineConfig.Network.Plugin == "canal" {
+		enableNetworkPolicy := true
+		cluster.Spec.EnableNetworkPolicy = &enableNetworkPolicy
+		cluster.Annotations["networking.management.cattle.io/enable-network-policy"] = "true"
+	}
+	return nil
 }
 
 func (cd *clusterDeploy) getKubeConfig(cluster *v3.Cluster) (*clientcmdapi.Config, error) {
@@ -135,7 +199,10 @@ func (cd *clusterDeploy) getKubeConfig(cluster *v3.Cluster) (*clientcmdapi.Confi
 	return cd.clusterManager.KubeConfig(cluster.Name, token), nil
 }
 
-func (cd *clusterDeploy) getYAML(cluster *v3.Cluster, agentImage string) ([]byte, error) {
+func (cd *clusterDeploy) getYAML(cluster *v3.Cluster, agentImage, authImage string) ([]byte, error) {
+	logrus.Debug("Desired agent image:", agentImage)
+	logrus.Debug("Desired auth image:", authImage)
+
 	token, err := cd.systemAccountManager.GetOrCreateSystemClusterToken(cluster.Name)
 	if err != nil {
 		return nil, err
@@ -147,7 +214,7 @@ func (cd *clusterDeploy) getYAML(cluster *v3.Cluster, agentImage string) ([]byte
 	}
 
 	buf := &bytes.Buffer{}
-	err = systemtemplate.SystemTemplate(buf, agentImage, token, url)
+	err = systemtemplate.SystemTemplate(buf, agentImage, authImage, token, url)
 
 	return buf.Bytes(), err
 }

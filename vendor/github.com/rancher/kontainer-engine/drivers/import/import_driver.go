@@ -33,6 +33,10 @@ func (d *Driver) GetCapabilities(ctx context.Context) (*types.Capabilities, erro
 	return &types.Capabilities{Capabilities: make(map[int64]bool)}, nil
 }
 
+func (d *Driver) GetK8SCapabilities(ctx context.Context, opts *types.DriverOptions) (*types.K8SCapabilities, error) {
+	return &types.K8SCapabilities{}, nil
+}
+
 func getDriverOptions() *types.DriverFlags {
 	driverFlag := types.DriverFlags{
 		Options: make(map[string]*types.Flag),
@@ -56,7 +60,7 @@ func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags
 	return getDriverOptions(), nil
 }
 
-func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions) (*types.ClusterInfo, error) {
+func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions, _ *types.ClusterInfo) (*types.ClusterInfo, error) {
 	logrus.Info("importing kubeconfig file into clusters")
 
 	configPath := opts.StringOptions["kubeConfigPath"]
@@ -174,4 +178,16 @@ func (d *Driver) PostCheck(ctx context.Context, info *types.ClusterInfo) (*types
 func (d *Driver) Remove(ctx context.Context, clusterInfo *types.ClusterInfo) error {
 	// Nothing to do
 	return nil
+}
+
+func (d *Driver) ETCDSave(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) error {
+	return fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) ETCDRestore(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) error {
+	return fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) RemoveLegacyServiceAccount(ctx context.Context, info *types.ClusterInfo) error {
+	return fmt.Errorf("not implemented")
 }

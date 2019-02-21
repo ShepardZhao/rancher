@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	clusterController "github.com/rancher/rancher/pkg/controllers/user"
@@ -22,6 +23,7 @@ import (
 	"github.com/rancher/types/config/dialer"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/util/cert"
@@ -31,15 +33,19 @@ type Manager struct {
 	httpsPort     int
 	ScaledContext *config.ScaledContext
 	clusterLister v3.ClusterLister
+	clusters      v3.ClusterInterface
 	controllers   sync.Map
 	accessControl types.AccessControl
 	dialer        dialer.Factory
 }
 
 type record struct {
+	sync.Mutex
 	clusterRec    *v3.Cluster
 	cluster       *config.UserContext
 	accessControl types.AccessControl
+	started       bool
+	owner         bool
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -48,9 +54,9 @@ func NewManager(httpsPort int, context *config.ScaledContext) *Manager {
 	return &Manager{
 		httpsPort:     httpsPort,
 		ScaledContext: context,
-		dialer:        context.Dialer,
 		accessControl: rbac.NewAccessControl(context.RBAC),
 		clusterLister: context.Management.Clusters("").Controller().Lister(),
+		clusters:      context.Management.Clusters(""),
 	}
 }
 
@@ -59,18 +65,21 @@ func (m *Manager) Stop(cluster *v3.Cluster) {
 	if !ok {
 		return
 	}
-	logrus.Info("Stopping cluster agent for", obj.(*record).cluster.ClusterName)
+	logrus.Infof("Stopping cluster agent for %s", obj.(*record).cluster.ClusterName)
 	obj.(*record).cancel()
 	m.controllers.Delete(cluster.UID)
 }
 
-func (m *Manager) Start(ctx context.Context, cluster *v3.Cluster) error {
+func (m *Manager) Start(ctx context.Context, cluster *v3.Cluster, clusterOwner bool) error {
+	if cluster.DeletionTimestamp != nil {
+		return nil
+	}
 	// reload cluster, always use the cached one
 	cluster, err := m.clusterLister.Get("", cluster.Name)
 	if err != nil {
 		return err
 	}
-	_, err = m.start(ctx, cluster)
+	_, err = m.start(ctx, cluster, true, clusterOwner)
 	return err
 }
 
@@ -84,55 +93,112 @@ func (m *Manager) RESTConfig(cluster *v3.Cluster) (rest.Config, error) {
 	return record.cluster.RESTConfig, nil
 }
 
-func (m *Manager) start(ctx context.Context, cluster *v3.Cluster) (*record, error) {
+func (m *Manager) markUnavailable(clusterName string) {
+	if cluster, err := m.clusters.Get(clusterName, v1.GetOptions{}); err == nil {
+		if !v3.ClusterConditionReady.IsFalse(cluster) {
+			v3.ClusterConditionReady.False(cluster)
+			m.clusters.Update(cluster)
+		}
+		m.Stop(cluster)
+	}
+}
+
+func (m *Manager) start(ctx context.Context, cluster *v3.Cluster, controllers, clusterOwner bool) (*record, error) {
 	obj, ok := m.controllers.Load(cluster.UID)
 	if ok {
-		if !m.changed(obj.(*record), cluster) {
-			return obj.(*record), nil
+		if !m.changed(obj.(*record), cluster, controllers, clusterOwner) {
+			return obj.(*record), m.startController(obj.(*record), controllers, clusterOwner)
 		}
 		m.Stop(obj.(*record).clusterRec)
 	}
 
 	controller, err := m.toRecord(ctx, cluster)
 	if err != nil {
+		m.markUnavailable(cluster.Name)
 		return nil, err
 	}
 	if controller == nil {
 		return nil, httperror.NewAPIError(httperror.ClusterUnavailable, "cluster not found")
 	}
 
-	obj, loaded := m.controllers.LoadOrStore(cluster.UID, controller)
-	if !loaded {
-		go func() {
-			if err := m.doStart(obj.(*record)); err != nil {
-				m.Stop(cluster)
-			}
-		}()
+	obj, _ = m.controllers.LoadOrStore(cluster.UID, controller)
+	if err := m.startController(obj.(*record), controllers, clusterOwner); err != nil {
+		m.markUnavailable(cluster.Name)
+		return nil, err
 	}
-
 	return obj.(*record), nil
 }
 
-func (m *Manager) changed(r *record, cluster *v3.Cluster) bool {
+func (m *Manager) startController(r *record, controllers, clusterOwner bool) error {
+	if !controllers {
+		return nil
+	}
+
+	if _, err := r.cluster.K8sClient.Discovery().ServerVersion(); err != nil {
+		return errors.Wrapf(err, "failed to contact server")
+	}
+
+	r.Lock()
+	defer r.Unlock()
+	if !r.started {
+		if err := m.doStart(r, clusterOwner); err != nil {
+			m.Stop(r.clusterRec)
+			return err
+		}
+		r.started = true
+		r.owner = clusterOwner
+	}
+	return nil
+}
+
+func (m *Manager) changed(r *record, cluster *v3.Cluster, controllers, clusterOwner bool) bool {
 	existing := r.clusterRec
 	if existing.Status.APIEndpoint != cluster.Status.APIEndpoint ||
 		existing.Status.ServiceAccountToken != cluster.Status.ServiceAccountToken ||
-		existing.Status.CACert != cluster.Status.CACert {
+		existing.Status.CACert != cluster.Status.CACert ||
+		existing.Status.AppliedSpec.LocalClusterAuthEndpoint.Enabled != cluster.Status.AppliedSpec.LocalClusterAuthEndpoint.Enabled {
+		return true
+	}
+
+	if controllers && r.started && clusterOwner != r.owner {
 		return true
 	}
 
 	return false
 }
 
-func (m *Manager) doStart(rec *record) error {
-	logrus.Info("Starting cluster agent for", rec.cluster.ClusterName)
-	if err := clusterController.Register(rec.ctx, rec.cluster, m, m); err != nil {
+func (m *Manager) doStart(rec *record, clusterOwner bool) (exit error) {
+	defer func() {
+		if exit == nil {
+			logrus.Infof("Starting cluster agent for %s [owner=%v]", rec.cluster.ClusterName, clusterOwner)
+		}
+	}()
+
+	if clusterOwner {
+		if err := clusterController.Register(rec.ctx, rec.cluster, rec.clusterRec, m, m); err != nil {
+			return err
+		}
+	} else {
+		if err := clusterController.RegisterFollower(rec.ctx, rec.cluster, m, m); err != nil {
+			return err
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- rec.cluster.Start(rec.ctx)
+	}()
+
+	select {
+	case <-time.After(30 * time.Second):
+		rec.cancel()
+		return fmt.Errorf("timeout syncing controllers")
+	case err := <-done:
 		return err
 	}
-	return rec.cluster.Start(rec.ctx)
 }
 
-func (m *Manager) toRESTConfig(cluster *v3.Cluster) (*rest.Config, error) {
+func ToRESTConfig(cluster *v3.Cluster, context *config.ScaledContext) (*rest.Config, error) {
 	if cluster == nil {
 		return nil, nil
 	}
@@ -142,7 +208,7 @@ func (m *Manager) toRESTConfig(cluster *v3.Cluster) (*rest.Config, error) {
 	}
 
 	if cluster.Spec.Internal {
-		return m.ScaledContext.LocalConfig, nil
+		return context.LocalConfig, nil
 	}
 
 	if cluster.Status.APIEndpoint == "" || cluster.Status.CACert == "" || cluster.Status.ServiceAccountToken == "" {
@@ -163,7 +229,7 @@ func (m *Manager) toRESTConfig(cluster *v3.Cluster) (*rest.Config, error) {
 		return nil, err
 	}
 
-	clusterDialer, err := m.dialer.ClusterDialer(cluster.Name)
+	clusterDialer, err := context.Dialer.ClusterDialer(cluster.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -176,12 +242,13 @@ func (m *Manager) toRESTConfig(cluster *v3.Cluster) (*rest.Config, error) {
 		}
 	}
 
+	// adding suffix to make tlsConfig hashkey unique
+	suffix := []byte("\n" + cluster.Name)
 	rc := &rest.Config{
-		Host:        u.Host,
-		Prefix:      u.Path,
+		Host:        u.String(),
 		BearerToken: cluster.Status.ServiceAccountToken,
 		TLSClientConfig: rest.TLSClientConfig{
-			CAData: caBytes,
+			CAData: append(caBytes, suffix...),
 		},
 		Timeout: 30 * time.Second,
 		WrapTransport: func(rt http.RoundTripper) http.RoundTripper {
@@ -265,7 +332,7 @@ func VerifyIgnoreDNSName(caCertsPEM []byte) (func(rawCerts [][]byte, verifiedCha
 }
 
 func (m *Manager) toRecord(ctx context.Context, cluster *v3.Cluster) (*record, error) {
-	kubeConfig, err := m.toRESTConfig(cluster)
+	kubeConfig, err := ToRESTConfig(cluster, m.ScaledContext)
 	if kubeConfig == nil || err != nil {
 		return nil, err
 	}
@@ -296,17 +363,6 @@ func (m *Manager) AccessControl(apiContext *types.APIContext, storageContext typ
 	return record.accessControl, nil
 }
 
-func (m *Manager) Config(apiContext *types.APIContext, storageContext types.StorageContext) (rest.Config, error) {
-	record, err := m.record(apiContext, storageContext)
-	if err != nil {
-		return rest.Config{}, err
-	}
-	if record == nil {
-		return m.ScaledContext.RESTConfig, nil
-	}
-	return record.cluster.RESTConfig, nil
-}
-
 func (m *Manager) UnversionedClient(apiContext *types.APIContext, storageContext types.StorageContext) (rest.Interface, error) {
 	record, err := m.record(apiContext, storageContext)
 	if err != nil {
@@ -319,14 +375,7 @@ func (m *Manager) UnversionedClient(apiContext *types.APIContext, storageContext
 }
 
 func (m *Manager) APIExtClient(apiContext *types.APIContext, storageContext types.StorageContext) (clientset.Interface, error) {
-	record, err := m.record(apiContext, storageContext)
-	if err != nil {
-		return nil, err
-	}
-	if record == nil {
-		return m.ScaledContext.APIExtClient, nil
-	}
-	return record.cluster.APIExtClient, nil
+	return m.ScaledContext.APIExtClient, nil
 }
 
 func (m *Manager) UserContext(clusterName string) (*config.UserContext, error) {
@@ -335,7 +384,7 @@ func (m *Manager) UserContext(clusterName string) (*config.UserContext, error) {
 		return nil, err
 	}
 
-	record, err := m.start(context.Background(), cluster)
+	record, err := m.start(context.Background(), cluster, false, false)
 	if err != nil || record == nil {
 		msg := ""
 		if err != nil {
@@ -362,7 +411,7 @@ func (m *Manager) record(apiContext *types.APIContext, storageContext types.Stor
 	if cluster == nil {
 		return nil, nil
 	}
-	record, err := m.start(context.Background(), cluster)
+	record, err := m.start(context.Background(), cluster, false, false)
 	if err != nil {
 		return nil, httperror.NewAPIError(httperror.ClusterUnavailable, err.Error())
 	}

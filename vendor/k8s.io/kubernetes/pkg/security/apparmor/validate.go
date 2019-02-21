@@ -112,7 +112,7 @@ func validateHost(runtime string) error {
 	}
 
 	// Check runtime support. Currently only Docker is supported.
-	if runtime != kubetypes.DockerContainerRuntime && runtime != kubetypes.RemoteContainerRuntime {
+	if runtime != kubetypes.RemoteContainerRuntime {
 		return fmt.Errorf("AppArmor is only enabled for 'docker' and 'remote' runtimes. Found: %q.", runtime)
 	}
 
@@ -136,7 +136,7 @@ func validateProfile(profile string, loadedProfiles map[string]bool) error {
 }
 
 func ValidateProfileFormat(profile string) error {
-	if profile == "" || profile == ProfileRuntimeDefault {
+	if profile == "" || profile == ProfileRuntimeDefault || profile == ProfileNameUnconfined {
 		return nil
 	}
 	if !strings.HasPrefix(profile, ProfileNamePrefix) {

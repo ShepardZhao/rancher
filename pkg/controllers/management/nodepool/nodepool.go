@@ -1,13 +1,17 @@
 package nodepool
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"time"
 
+	"reflect"
+
 	"github.com/rancher/rancher/pkg/ref"
+	"github.com/rancher/rke/services"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
@@ -28,7 +32,7 @@ type Controller struct {
 	Nodes              v3.NodeInterface
 }
 
-func Register(management *config.ManagementContext) {
+func Register(ctx context.Context, management *config.ManagementContext) {
 	p := &Controller{
 		NodePoolController: management.Management.NodePools("").Controller(),
 		NodePoolLister:     management.Management.NodePools("").Controller().Lister(),
@@ -38,22 +42,22 @@ func Register(management *config.ManagementContext) {
 	}
 
 	// Add handlers
-	p.NodePools.AddLifecycle("nodepool-provisioner", p)
-	management.Management.Nodes("").AddHandler("nodepool-provisioner", p.machineChanged)
+	p.NodePools.AddLifecycle(ctx, "nodepool-provisioner", p)
+	management.Management.Nodes("").AddHandler(ctx, "nodepool-provisioner", p.machineChanged)
 }
 
-func (c *Controller) Create(nodePool *v3.NodePool) (*v3.NodePool, error) {
+func (c *Controller) Create(nodePool *v3.NodePool) (runtime.Object, error) {
 	return nodePool, nil
 }
 
-func (c *Controller) Updated(nodePool *v3.NodePool) (*v3.NodePool, error) {
+func (c *Controller) Updated(nodePool *v3.NodePool) (runtime.Object, error) {
 	obj, err := v3.NodePoolConditionUpdated.Do(nodePool, func() (runtime.Object, error) {
 		return nodePool, c.createNodes(nodePool)
 	})
 	return obj.(*v3.NodePool), err
 }
 
-func (c *Controller) Remove(nodePool *v3.NodePool) (*v3.NodePool, error) {
+func (c *Controller) Remove(nodePool *v3.NodePool) (runtime.Object, error) {
 	logrus.Infof("Deleting nodePool [%s]", nodePool.Name)
 
 	allNodes, err := c.nodes(nodePool, false)
@@ -76,11 +80,11 @@ func (c *Controller) Remove(nodePool *v3.NodePool) (*v3.NodePool, error) {
 	return nodePool, nil
 }
 
-func (c *Controller) machineChanged(key string, machine *v3.Node) error {
+func (c *Controller) machineChanged(key string, machine *v3.Node) (runtime.Object, error) {
 	if machine == nil {
 		nps, err := c.NodePoolLister.List("", labels.Everything())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, np := range nps {
 			c.NodePoolController.Enqueue(np.Namespace, np.Name)
@@ -90,7 +94,7 @@ func (c *Controller) machineChanged(key string, machine *v3.Node) error {
 		c.NodePoolController.Enqueue(ns, name)
 	}
 
-	return nil
+	return nil, nil
 }
 
 func (c *Controller) createNode(name string, nodePool *v3.NodePool, simulate bool) (*v3.Node, error) {
@@ -108,7 +112,6 @@ func (c *Controller) createNode(name string, nodePool *v3.NodePool, simulate boo
 			NodeTemplateName:  nodePool.Spec.NodeTemplateName,
 			NodePoolName:      ref.Ref(nodePool),
 			RequestedHostname: name,
-			ClusterName:       nodePool.Namespace,
 		},
 	}
 
@@ -183,7 +186,7 @@ func (c *Controller) nodes(nodePool *v3.NodePool, simulate bool) ([]*v3.Node, er
 func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (bool, error) {
 	var (
 		err     error
-		byName  = map[string]bool{}
+		byName  = map[string]*v3.Node{}
 		changed = false
 		nodes   []*v3.Node
 	)
@@ -194,7 +197,7 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 	}
 
 	for _, node := range allNodes {
-		byName[node.Spec.RequestedHostname] = true
+		byName[node.Spec.RequestedHostname] = node
 
 		_, nodePoolName := ref.Parse(node.Spec.NodePoolName)
 		if nodePoolName != nodePool.Name {
@@ -225,7 +228,7 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 			name = fmt.Sprintf("%s%0"+strconv.Itoa(minLength)+"d", prefix, i)
 		}
 
-		if byName[name] {
+		if byName[name] != nil {
 			continue
 		}
 
@@ -235,7 +238,7 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 			return false, err
 		}
 
-		byName[newNode.Spec.RequestedHostname] = true
+		byName[newNode.Spec.RequestedHostname] = newNode
 		nodes = append(nodes, newNode)
 	}
 
@@ -255,5 +258,64 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 		delete(byName, toDelete.Spec.RequestedHostname)
 	}
 
+	for _, n := range nodes {
+		if needRoleUpdate(n, nodePool) {
+			changed = true
+			_, err := c.updateNodeRoles(n, nodePool, simulate)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+
 	return changed, nil
+}
+
+func needRoleUpdate(node *v3.Node, nodePool *v3.NodePool) bool {
+	if node.Status.NodeConfig == nil {
+		return false
+	}
+	if len(node.Status.NodeConfig.Role) == 0 && !nodePool.Spec.Worker {
+		return true
+	}
+
+	nodeRolesMap := map[string]bool{}
+	for _, role := range node.Status.NodeConfig.Role {
+		switch r := role; r {
+		case services.ETCDRole:
+			nodeRolesMap[services.ETCDRole] = true
+		case services.ControlRole:
+			nodeRolesMap[services.ControlRole] = true
+		case services.WorkerRole:
+			nodeRolesMap[services.WorkerRole] = true
+		}
+	}
+
+	poolRolesMap := map[string]bool{}
+	poolRolesMap[services.ETCDRole] = nodePool.Spec.Etcd
+	poolRolesMap[services.ControlRole] = nodePool.Spec.ControlPlane
+	poolRolesMap[services.WorkerRole] = nodePool.Spec.Worker
+	return !reflect.DeepEqual(nodeRolesMap, poolRolesMap)
+}
+
+func (c *Controller) updateNodeRoles(existing *v3.Node, nodePool *v3.NodePool, simulate bool) (*v3.Node, error) {
+	toUpdate := existing.DeepCopy()
+	var newRoles []string
+
+	if nodePool.Spec.ControlPlane {
+		newRoles = append(newRoles, "controlplane")
+	}
+	if nodePool.Spec.Etcd {
+		newRoles = append(newRoles, "etcd")
+	}
+	if nodePool.Spec.Worker {
+		newRoles = append(newRoles, "worker")
+	}
+
+	toUpdate.Status.NodeConfig.Role = newRoles
+	if simulate {
+		return toUpdate, nil
+	}
+
+	return c.Nodes.Update(toUpdate)
 }

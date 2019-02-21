@@ -18,6 +18,7 @@ package options
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,48 +26,16 @@ import (
 	"github.com/spf13/pflag"
 
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	genericoptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authenticator"
-	authzmodes "k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 )
 
 type BuiltInAuthenticationOptions struct {
-	Anonymous       *AnonymousAuthenticationOptions
-	BootstrapToken  *BootstrapTokenAuthenticationOptions
-	ClientCert      *genericoptions.ClientCertAuthenticationOptions
-	Keystone        *KeystoneAuthenticationOptions
-	OIDC            *OIDCAuthenticationOptions
 	PasswordFile    *PasswordFileAuthenticationOptions
-	RequestHeader   *genericoptions.RequestHeaderAuthenticationOptions
 	ServiceAccounts *ServiceAccountAuthenticationOptions
-	TokenFile       *TokenFileAuthenticationOptions
 	WebHook         *WebHookAuthenticationOptions
 
 	TokenSuccessCacheTTL time.Duration
 	TokenFailureCacheTTL time.Duration
-}
-
-type AnonymousAuthenticationOptions struct {
-	Allow bool
-}
-
-type BootstrapTokenAuthenticationOptions struct {
-	Enable bool
-}
-
-type KeystoneAuthenticationOptions struct {
-	URL    string
-	CAFile string
-}
-
-type OIDCAuthenticationOptions struct {
-	CAFile         string
-	ClientID       string
-	IssuerURL      string
-	UsernameClaim  string
-	UsernamePrefix string
-	GroupsClaim    string
-	GroupsPrefix   string
 }
 
 type PasswordFileAuthenticationOptions struct {
@@ -74,12 +43,11 @@ type PasswordFileAuthenticationOptions struct {
 }
 
 type ServiceAccountAuthenticationOptions struct {
-	KeyFiles []string
-	Lookup   bool
-}
-
-type TokenFileAuthenticationOptions struct {
-	TokenFile string
+	KeyFiles      []string
+	Lookup        bool
+	Issuer        string
+	APIAudiences  []string
+	MaxExpiration time.Duration
 }
 
 type WebHookAuthenticationOptions struct {
@@ -96,41 +64,9 @@ func NewBuiltInAuthenticationOptions() *BuiltInAuthenticationOptions {
 
 func (s *BuiltInAuthenticationOptions) WithAll() *BuiltInAuthenticationOptions {
 	return s.
-		WithAnonymous().
-		WithBootstrapToken().
-		WithClientCert().
-		WithKeystone().
-		WithOIDC().
 		WithPasswordFile().
-		WithRequestHeader().
 		WithServiceAccounts().
-		WithTokenFile().
 		WithWebHook()
-}
-
-func (s *BuiltInAuthenticationOptions) WithAnonymous() *BuiltInAuthenticationOptions {
-	s.Anonymous = &AnonymousAuthenticationOptions{Allow: true}
-	return s
-}
-
-func (s *BuiltInAuthenticationOptions) WithBootstrapToken() *BuiltInAuthenticationOptions {
-	s.BootstrapToken = &BootstrapTokenAuthenticationOptions{}
-	return s
-}
-
-func (s *BuiltInAuthenticationOptions) WithClientCert() *BuiltInAuthenticationOptions {
-	s.ClientCert = &genericoptions.ClientCertAuthenticationOptions{}
-	return s
-}
-
-func (s *BuiltInAuthenticationOptions) WithKeystone() *BuiltInAuthenticationOptions {
-	s.Keystone = &KeystoneAuthenticationOptions{}
-	return s
-}
-
-func (s *BuiltInAuthenticationOptions) WithOIDC() *BuiltInAuthenticationOptions {
-	s.OIDC = &OIDCAuthenticationOptions{}
-	return s
 }
 
 func (s *BuiltInAuthenticationOptions) WithPasswordFile() *BuiltInAuthenticationOptions {
@@ -138,18 +74,8 @@ func (s *BuiltInAuthenticationOptions) WithPasswordFile() *BuiltInAuthentication
 	return s
 }
 
-func (s *BuiltInAuthenticationOptions) WithRequestHeader() *BuiltInAuthenticationOptions {
-	s.RequestHeader = &genericoptions.RequestHeaderAuthenticationOptions{}
-	return s
-}
-
 func (s *BuiltInAuthenticationOptions) WithServiceAccounts() *BuiltInAuthenticationOptions {
 	s.ServiceAccounts = &ServiceAccountAuthenticationOptions{Lookup: true}
-	return s
-}
-
-func (s *BuiltInAuthenticationOptions) WithTokenFile() *BuiltInAuthenticationOptions {
-	s.TokenFile = &TokenFileAuthenticationOptions{}
 	return s
 }
 
@@ -164,101 +90,44 @@ func (s *BuiltInAuthenticationOptions) WithWebHook() *BuiltInAuthenticationOptio
 func (s *BuiltInAuthenticationOptions) Validate() []error {
 	allErrors := []error{}
 
-	if s.OIDC != nil && (len(s.OIDC.IssuerURL) > 0) != (len(s.OIDC.ClientID) > 0) {
-		allErrors = append(allErrors, fmt.Errorf("oidc-issuer-url and oidc-client-id should be specified together"))
+	if s.ServiceAccounts != nil && len(s.ServiceAccounts.Issuer) > 0 && strings.Contains(s.ServiceAccounts.Issuer, ":") {
+		if _, err := url.Parse(s.ServiceAccounts.Issuer); err != nil {
+			allErrors = append(allErrors, fmt.Errorf("service-account-issuer contained a ':' but was not a valid URL: %v", err))
+		}
 	}
 
 	return allErrors
 }
 
 func (s *BuiltInAuthenticationOptions) AddFlags(fs *pflag.FlagSet) {
-	if s.Anonymous != nil {
-		fs.BoolVar(&s.Anonymous.Allow, "anonymous-auth", s.Anonymous.Allow, ""+
-			"Enables anonymous requests to the secure port of the API server. "+
-			"Requests that are not rejected by another authentication method are treated as anonymous requests. "+
-			"Anonymous requests have a username of system:anonymous, and a group name of system:unauthenticated.")
-	}
-
-	if s.BootstrapToken != nil {
-		fs.BoolVar(&s.BootstrapToken.Enable, "experimental-bootstrap-token-auth", s.BootstrapToken.Enable, ""+
-			"Deprecated (use --enable-bootstrap-token-auth).")
-		fs.MarkDeprecated("experimental-bootstrap-token-auth", "use --enable-bootstrap-token-auth instead.")
-
-		fs.BoolVar(&s.BootstrapToken.Enable, "enable-bootstrap-token-auth", s.BootstrapToken.Enable, ""+
-			"Enable to allow secrets of type 'bootstrap.kubernetes.io/token' in the 'kube-system' "+
-			"namespace to be used for TLS bootstrapping authentication.")
-	}
-
-	if s.ClientCert != nil {
-		s.ClientCert.AddFlags(fs)
-	}
-
-	if s.Keystone != nil {
-		fs.StringVar(&s.Keystone.URL, "experimental-keystone-url", s.Keystone.URL,
-			"If passed, activates the keystone authentication plugin.")
-
-		fs.StringVar(&s.Keystone.CAFile, "experimental-keystone-ca-file", s.Keystone.CAFile, ""+
-			"If set, the Keystone server's certificate will be verified by one of the authorities "+
-			"in the experimental-keystone-ca-file, otherwise the host's root CA set will be used.")
-	}
-
-	if s.OIDC != nil {
-		fs.StringVar(&s.OIDC.IssuerURL, "oidc-issuer-url", s.OIDC.IssuerURL, ""+
-			"The URL of the OpenID issuer, only HTTPS scheme will be accepted. "+
-			"If set, it will be used to verify the OIDC JSON Web Token (JWT).")
-
-		fs.StringVar(&s.OIDC.ClientID, "oidc-client-id", s.OIDC.ClientID,
-			"The client ID for the OpenID Connect client, must be set if oidc-issuer-url is set.")
-
-		fs.StringVar(&s.OIDC.CAFile, "oidc-ca-file", s.OIDC.CAFile, ""+
-			"If set, the OpenID server's certificate will be verified by one of the authorities "+
-			"in the oidc-ca-file, otherwise the host's root CA set will be used.")
-
-		fs.StringVar(&s.OIDC.UsernameClaim, "oidc-username-claim", "sub", ""+
-			"The OpenID claim to use as the user name. Note that claims other than the default ('sub') "+
-			"is not guaranteed to be unique and immutable. This flag is experimental, please see "+
-			"the authentication documentation for further details.")
-
-		fs.StringVar(&s.OIDC.UsernamePrefix, "oidc-username-prefix", "", ""+
-			"If provided, all usernames will be prefixed with this value. If not provided, "+
-			"username claims other than 'email' are prefixed by the issuer URL to avoid "+
-			"clashes. To skip any prefixing, provide the value '-'.")
-
-		fs.StringVar(&s.OIDC.GroupsClaim, "oidc-groups-claim", "", ""+
-			"If provided, the name of a custom OpenID Connect claim for specifying user groups. "+
-			"The claim value is expected to be a string or array of strings. This flag is experimental, "+
-			"please see the authentication documentation for further details.")
-
-		fs.StringVar(&s.OIDC.GroupsPrefix, "oidc-groups-prefix", "", ""+
-			"If provided, all groups will be prefixed with this value to prevent conflicts with "+
-			"other authentication strategies.")
-
-	}
-
 	if s.PasswordFile != nil {
 		fs.StringVar(&s.PasswordFile.BasicAuthFile, "basic-auth-file", s.PasswordFile.BasicAuthFile, ""+
 			"If set, the file that will be used to admit requests to the secure port of the API server "+
 			"via http basic authentication.")
 	}
 
-	if s.RequestHeader != nil {
-		s.RequestHeader.AddFlags(fs)
-	}
-
 	if s.ServiceAccounts != nil {
 		fs.StringArrayVar(&s.ServiceAccounts.KeyFiles, "service-account-key-file", s.ServiceAccounts.KeyFiles, ""+
 			"File containing PEM-encoded x509 RSA or ECDSA private or public keys, used to verify "+
-			"ServiceAccount tokens. If unspecified, --tls-private-key-file is used. "+
-			"The specified file can contain multiple keys, and the flag can be specified multiple times with different files.")
+			"ServiceAccount tokens. The specified file can contain multiple keys, and the flag can "+
+			"be specified multiple times with different files. If unspecified, "+
+			"--tls-private-key-file is used. Must be specified when "+
+			"--service-account-signing-key is provided")
 
 		fs.BoolVar(&s.ServiceAccounts.Lookup, "service-account-lookup", s.ServiceAccounts.Lookup,
 			"If true, validate ServiceAccount tokens exist in etcd as part of authentication.")
-	}
 
-	if s.TokenFile != nil {
-		fs.StringVar(&s.TokenFile.TokenFile, "token-auth-file", s.TokenFile.TokenFile, ""+
-			"If set, the file that will be used to secure the secure port of the API server "+
-			"via token authentication.")
+		fs.StringVar(&s.ServiceAccounts.Issuer, "service-account-issuer", s.ServiceAccounts.Issuer, ""+
+			"Identifier of the service account token issuer. The issuer will assert this identifier "+
+			"in \"iss\" claim of issued tokens. This value is a string or URI.")
+
+		fs.StringSliceVar(&s.ServiceAccounts.APIAudiences, "service-account-api-audiences", s.ServiceAccounts.APIAudiences, ""+
+			"Identifiers of the API. The service account token authenticator will validate that "+
+			"tokens used against the API are bound to at least one of these audiences.")
+
+		fs.DurationVar(&s.ServiceAccounts.MaxExpiration, "service-account-max-token-expiration", s.ServiceAccounts.MaxExpiration, ""+
+			"The maximum validity duration of a token created by the service account token issuer. If an otherwise valid "+
+			"TokenRequest with a validity duration larger than this value is requested, a token will be issued with a validity duration of this value.")
 	}
 
 	if s.WebHook != nil {
@@ -277,48 +146,15 @@ func (s *BuiltInAuthenticationOptions) ToAuthenticationConfig() authenticator.Au
 		TokenFailureCacheTTL: s.TokenFailureCacheTTL,
 	}
 
-	if s.Anonymous != nil {
-		ret.Anonymous = s.Anonymous.Allow
-	}
-
-	if s.BootstrapToken != nil {
-		ret.BootstrapToken = s.BootstrapToken.Enable
-	}
-
-	if s.ClientCert != nil {
-		ret.ClientCAFile = s.ClientCert.ClientCA
-	}
-
-	if s.Keystone != nil {
-		ret.KeystoneURL = s.Keystone.URL
-		ret.KeystoneCAFile = s.Keystone.CAFile
-	}
-
-	if s.OIDC != nil {
-		ret.OIDCCAFile = s.OIDC.CAFile
-		ret.OIDCClientID = s.OIDC.ClientID
-		ret.OIDCGroupsClaim = s.OIDC.GroupsClaim
-		ret.OIDCGroupsPrefix = s.OIDC.GroupsPrefix
-		ret.OIDCIssuerURL = s.OIDC.IssuerURL
-		ret.OIDCUsernameClaim = s.OIDC.UsernameClaim
-		ret.OIDCUsernamePrefix = s.OIDC.UsernamePrefix
-	}
-
 	if s.PasswordFile != nil {
 		ret.BasicAuthFile = s.PasswordFile.BasicAuthFile
-	}
-
-	if s.RequestHeader != nil {
-		ret.RequestHeaderConfig = s.RequestHeader.ToAuthenticationRequestHeaderConfig()
 	}
 
 	if s.ServiceAccounts != nil {
 		ret.ServiceAccountKeyFiles = s.ServiceAccounts.KeyFiles
 		ret.ServiceAccountLookup = s.ServiceAccounts.Lookup
-	}
-
-	if s.TokenFile != nil {
-		ret.TokenAuthFile = s.TokenFile.TokenFile
+		ret.ServiceAccountIssuer = s.ServiceAccounts.Issuer
+		ret.ServiceAccountAPIAudiences = s.ServiceAccounts.APIAudiences
 	}
 
 	if s.WebHook != nil {
@@ -343,44 +179,14 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(c *genericapiserver.Config) error
 		return nil
 	}
 
-	var err error
-	if o.ClientCert != nil {
-		c, err = c.ApplyClientCert(o.ClientCert.ClientCA)
-		if err != nil {
-			return fmt.Errorf("unable to load client CA file: %v", err)
-		}
-	}
-	if o.RequestHeader != nil {
-		c, err = c.ApplyClientCert(o.RequestHeader.ClientCAFile)
-		if err != nil {
-			return fmt.Errorf("unable to load client CA file: %v", err)
-		}
-	}
-
-	c.SupportsBasicAuth = o.PasswordFile != nil && len(o.PasswordFile.BasicAuthFile) > 0
+	c.Authentication.SupportsBasicAuth = o.PasswordFile != nil && len(o.PasswordFile.BasicAuthFile) > 0
 
 	return nil
 }
 
 // ApplyAuthorization will conditionally modify the authentication options based on the authorization options
 func (o *BuiltInAuthenticationOptions) ApplyAuthorization(authorization *BuiltInAuthorizationOptions) {
-	if o == nil || authorization == nil || o.Anonymous == nil {
+	if o == nil || authorization == nil {
 		return
-	}
-
-	// authorization ModeAlwaysAllow cannot be combined with AnonymousAuth.
-	// in such a case the AnonymousAuth is stomped to false and you get a message
-	if o.Anonymous.Allow {
-		found := false
-		for _, mode := range strings.Split(authorization.Mode, ",") {
-			if mode == authzmodes.ModeAlwaysAllow {
-				found = true
-				break
-			}
-		}
-		if found {
-			glog.Warningf("AnonymousAuth is not allowed with the AllowAll authorizer.  Resetting AnonymousAuth to false. You should use a different authorizer")
-			o.Anonymous.Allow = false
-		}
 	}
 }

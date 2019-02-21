@@ -1,9 +1,11 @@
 package clusterstats
 
 import (
+	"context"
 	"reflect"
-
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/rancher/rancher/pkg/clustermanager"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
@@ -28,7 +30,7 @@ type ClusterNodeData struct {
 	ConditionNoMemoryPressureStatus v1.ConditionStatus
 }
 
-func Register(management *config.ManagementContext, clusterManager *clustermanager.Manager) {
+func Register(ctx context.Context, management *config.ManagementContext, clusterManager *clustermanager.Manager) {
 	clustersClient := management.Management.Clusters("")
 	machinesClient := management.Management.Nodes("")
 
@@ -38,25 +40,34 @@ func Register(management *config.ManagementContext, clusterManager *clustermanag
 		ClusterManager: clusterManager,
 	}
 
-	clustersClient.AddHandler("cluster-stats", s.sync)
-	machinesClient.AddHandler("cluster-stats", s.machineChanged)
+	clustersClient.AddHandler(ctx, "cluster-stats", s.sync)
+	machinesClient.AddHandler(ctx, "cluster-stats", s.machineChanged)
 }
 
-func (s *StatsAggregator) sync(key string, cluster *v3.Cluster) error {
+func (s *StatsAggregator) sync(key string, cluster *v3.Cluster) (runtime.Object, error) {
 	if cluster == nil {
-		return nil
+		return nil, nil
 	}
 
-	return s.aggregate(cluster, cluster.Name)
+	return nil, s.aggregate(cluster, cluster.Name)
 }
 
 func (s *StatsAggregator) aggregate(cluster *v3.Cluster, clusterName string) error {
-	machines, err := s.NodesLister.List(cluster.Name, labels.Everything())
+	allMachines, err := s.NodesLister.List(cluster.Name, labels.Everything())
 	if err != nil {
 		return err
 	}
 
+	var machines []*v3.Node
+	// only include worker nodes
+	for _, m := range allMachines {
+		if m.Spec.Worker && !m.Spec.InternalNodeSpec.Unschedulable {
+			machines = append(machines, m)
+		}
+	}
+
 	origStatus := cluster.Status.DeepCopy()
+	cluster = cluster.DeepCopy()
 
 	// capacity keys
 	pods, mem, cpu := resource.Quantity{}, resource.Quantity{}, resource.Quantity{}
@@ -119,22 +130,73 @@ func (s *StatsAggregator) aggregate(cluster *v3.Cluster, clusterName string) err
 		v3.ClusterConditionNoMemoryPressure.False(cluster)
 	}
 
-	if !reflect.DeepEqual(origStatus, &cluster.Status) {
-		userContext, err := s.ClusterManager.UserContext(cluster.Name)
-		if err == nil {
-			callWithTimeout(func() {
-				// This has the tendency to timeout
-				version, err := userContext.K8sClient.Discovery().ServerVersion()
-				if err == nil {
-					cluster.Status.Version = version
-				}
-			})
-		}
+	versionChanged := s.updateVersion(cluster)
+
+	if statsChanged(origStatus, &cluster.Status) || versionChanged {
 		_, err = s.Clusters.Update(cluster)
 		return err
 	}
 
 	return nil
+}
+
+func (s *StatsAggregator) updateVersion(cluster *v3.Cluster) bool {
+	updated := false
+	userContext, err := s.ClusterManager.UserContext(cluster.Name)
+	if err == nil {
+		callWithTimeout(func() {
+			// This has the tendency to timeout
+			version, err := userContext.K8sClient.Discovery().ServerVersion()
+			if err == nil {
+				isClusterVersionOk := cluster.Status.Version != nil
+				isNewVersionOk := version != nil
+				if isClusterVersionOk != isNewVersionOk ||
+					(isClusterVersionOk && *cluster.Status.Version != *version) {
+					cluster.Status.Version = version
+					updated = true
+				}
+			}
+		})
+	}
+	return updated
+}
+
+func statsChanged(existingCluster, newCluster *v3.ClusterStatus) bool {
+	if !reflect.DeepEqual(existingCluster.Conditions, newCluster.Conditions) {
+		return true
+	}
+
+	if resourceListChanged(existingCluster.Capacity, newCluster.Capacity) {
+		return true
+	}
+
+	if resourceListChanged(existingCluster.Allocatable, newCluster.Allocatable) {
+		return true
+	}
+
+	if resourceListChanged(existingCluster.Requested, newCluster.Requested) {
+		return true
+	}
+
+	if resourceListChanged(existingCluster.Limits, newCluster.Limits) {
+		return true
+	}
+
+	return false
+}
+
+func resourceListChanged(oldList, newList v1.ResourceList) bool {
+	if len(oldList) != len(newList) {
+		return true
+	}
+
+	for k, v := range oldList {
+		if v.Cmp(newList[k]) != 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 func callWithTimeout(do func()) {
@@ -150,9 +212,9 @@ func callWithTimeout(do func()) {
 	}
 }
 
-func (s *StatsAggregator) machineChanged(key string, machine *v3.Node) error {
+func (s *StatsAggregator) machineChanged(key string, machine *v3.Node) (runtime.Object, error) {
 	if machine != nil {
 		s.Clusters.Controller().Enqueue("", machine.Namespace)
 	}
-	return nil
+	return nil, nil
 }

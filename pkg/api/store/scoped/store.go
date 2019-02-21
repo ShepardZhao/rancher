@@ -39,6 +39,5 @@ func (s *Store) Create(apiContext *types.APIContext, schema *types.Schema, data 
 		parts := strings.Split(convert.ToString(data[s.key]), ":")
 		data["namespaceId"] = parts[len(parts)-1]
 	}
-
 	return s.Store.Create(apiContext, schema, data)
 }

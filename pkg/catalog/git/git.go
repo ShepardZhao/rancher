@@ -1,10 +1,13 @@
 package git
 
 import (
+	"bytes"
 	"fmt"
-	"github.com/pkg/errors"
+	"net/url"
 	"os/exec"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 func Clone(path, url, branch string) error {
@@ -41,5 +44,21 @@ func IsValid(url string) bool {
 
 func runcmd(name string, arg ...string) error {
 	cmd := exec.Command(name, arg...)
-	return cmd.Run()
+	bufErr := &bytes.Buffer{}
+	cmd.Stderr = bufErr
+	if err := cmd.Run(); err != nil {
+		return errors.Wrap(err, bufErr.String())
+	}
+	return nil
+}
+
+// FormatURL generates request url if is a private catalog
+func FormatURL(pathURL, username, password string) string {
+	if len(username) > 0 && len(password) > 0 {
+		if u, err := url.Parse(pathURL); err == nil {
+			u.User = url.UserPassword(username, password)
+			return u.String()
+		}
+	}
+	return pathURL
 }

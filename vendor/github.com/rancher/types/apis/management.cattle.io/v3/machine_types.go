@@ -40,10 +40,11 @@ type NodeTemplateCondition struct {
 }
 
 type NodeTemplateSpec struct {
-	DisplayName      string `json:"displayName"`
-	Description      string `json:"description"`
-	Driver           string `json:"driver" norman:"nocreate,noupdate"`
-	NodeCommonParams `json:",inline"`
+	DisplayName         string `json:"displayName"`
+	Description         string `json:"description"`
+	Driver              string `json:"driver" norman:"nocreate,noupdate"`
+	CloudCredentialName string `json:"cloudCredentialName" norman:"type=reference[cloudCredential]"`
+	NodeCommonParams    `json:",inline"`
 }
 
 type Node struct {
@@ -104,6 +105,7 @@ var (
 	NodeConditionRemoved     condition.Cond = "Removed"
 	NodeConditionConfigSaved condition.Cond = "Saved"
 	NodeConditionReady       condition.Cond = "Ready"
+	NodeConditionDrained     condition.Cond = "Drained"
 )
 
 type NodeCondition struct {
@@ -166,7 +168,10 @@ type CustomConfig struct {
 	// Optional - Docker socket on the node that will be used in tunneling
 	DockerSocket string `yaml:"docker_socket" json:"dockerSocket,omitempty"`
 	// SSH Private Key
-	SSHKey string `yaml:"ssh_key" json:"sshKey,omitempty"`
+	SSHKey string `yaml:"ssh_key" json:"sshKey,omitempty" norman:"type=password"`
+	// SSH Certificate
+	SSHCert string            `yaml:"ssh_cert" json:"sshCert,omitempty"`
+	Label   map[string]string `yaml:"label" json:"label,omitempty"`
 }
 
 type NodeSpec struct {
@@ -177,16 +182,19 @@ type NodeSpec struct {
 	Worker           bool   `json:"worker" norman:"noupdate"`
 	NodeTemplateName string `json:"nodeTemplateName,omitempty" norman:"type=reference[nodeTemplate],noupdate"`
 
-	NodePoolName           string            `json:"nodePoolName" norman:"type=reference[nodePool],nocreate,noupdate"`
-	CustomConfig           *CustomConfig     `json:"customConfig"`
-	Imported               bool              `json:"imported"`
-	Description            string            `json:"description,omitempty"`
-	DisplayName            string            `json:"displayName"`
-	RequestedHostname      string            `json:"requestedHostname,omitempty" norman:"type=dnsLabel,nullable,noupdate,required"`
-	ClusterName            string            `json:"clusterName,omitempty" norman:"type=reference[cluster],noupdate,required"`
-	InternalNodeSpec       v1.NodeSpec       `json:"internalNodeSpec"`
-	DesiredNodeLabels      map[string]string `json:"desiredNodeLabels,omitempty"`
-	DesiredNodeAnnotations map[string]string `json:"desiredNodeAnnotations,omitempty"`
+	NodePoolName             string            `json:"nodePoolName" norman:"type=reference[nodePool],nocreate,noupdate"`
+	CustomConfig             *CustomConfig     `json:"customConfig"`
+	Imported                 bool              `json:"imported"`
+	Description              string            `json:"description,omitempty"`
+	DisplayName              string            `json:"displayName"`
+	RequestedHostname        string            `json:"requestedHostname,omitempty" norman:"type=hostname,nullable,noupdate,required"`
+	InternalNodeSpec         v1.NodeSpec       `json:"internalNodeSpec"`
+	DesiredNodeLabels        map[string]string `json:"desiredNodeLabels,omitempty"`
+	DesiredNodeAnnotations   map[string]string `json:"desiredNodeAnnotations,omitempty"`
+	CurrentNodeLabels        map[string]string `json:"currentNodeLabels,omitempty"`
+	CurrentNodeAnnotations   map[string]string `json:"currentNodeAnnotations,omitempty"`
+	DesiredNodeUnschedulable string            `json:"desiredNodeUnschedulable,omitempty"`
+	NodeDrainInput           *NodeDrainInput   `json:"nodeDrainInput,omitempty"`
 }
 
 type NodeCommonParams struct {
@@ -270,4 +278,34 @@ type PublicEndpoint struct {
 	Path     string `json:"path,omitempty" norman:"nocreate,noupdate"`
 	// True when endpoint is exposed on every node
 	AllNodes bool `json:"allNodes" norman:"nocreate,noupdate"`
+}
+
+type NodeDrainInput struct {
+	// Drain node even if there are pods not managed by a ReplicationController, Job, or DaemonSet
+	// Drain will not proceed without Force set to true if there are such pods
+	Force bool `json:"force,omitempty"`
+	// If there are DaemonSet-managed pods, drain will not proceed without IgnoreDaemonSets set to true
+	// (even when set to true, kubectl won't delete pods - so setting default to true)
+	IgnoreDaemonSets bool `json:"ignoreDaemonSets,omitempty" norman:"default=true"`
+	// Continue even if there are pods using emptyDir
+	DeleteLocalData bool `json:"deleteLocalData,omitempty"`
+	//Period of time in seconds given to each pod to terminate gracefully.
+	// If negative, the default value specified in the pod will be used
+	GracePeriod int `json:"gracePeriod,omitempty" norman:"default=-1"`
+	// Time to wait (in seconds) before giving up for one try
+	Timeout int `json:"timeout" norman:"min=1,max=10800,default=60"`
+}
+
+type CloudCredential struct {
+	types.Namespaced
+
+	metav1.TypeMeta `json:",inline"`
+
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec CloudCredentialSpec `json:"spec"`
+}
+
+type CloudCredentialSpec struct {
+	Description string `json:"description,omitempty"`
 }

@@ -6,13 +6,13 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"net"
 
 	"github.com/docker/docker/client"
 	"github.com/rancher/rke/docker"
 	"github.com/rancher/rke/log"
+	"github.com/rancher/rke/util"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -20,10 +20,9 @@ import (
 
 const (
 	DockerAPIVersion = "1.24"
-	K8sVersion       = "1.8"
 )
 
-func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory) error {
+func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory, clusterPrefixPath string, clusterVersion string) error {
 	if h.DClient != nil {
 		return nil
 	}
@@ -38,10 +37,14 @@ func (h *Host) TunnelUp(ctx context.Context, dialerFactory DialerFactory) error 
 	if err != nil {
 		return fmt.Errorf("Can't initiate NewClient: %v", err)
 	}
-	return checkDockerVersion(ctx, h)
+	if err := checkDockerVersion(ctx, h, clusterVersion); err != nil {
+		return err
+	}
+	h.PrefixPath = GetPrefixPath(h.DockerInfo.OperatingSystem, clusterPrefixPath)
+	return nil
 }
 
-func (h *Host) TunnelUpLocal(ctx context.Context) error {
+func (h *Host) TunnelUpLocal(ctx context.Context, clusterVersion string) error {
 	var err error
 	if h.DClient != nil {
 		return nil
@@ -52,16 +55,21 @@ func (h *Host) TunnelUpLocal(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("Can't initiate NewClient: %v", err)
 	}
-	return checkDockerVersion(ctx, h)
+	return checkDockerVersion(ctx, h, clusterVersion)
 }
 
-func checkDockerVersion(ctx context.Context, h *Host) error {
+func checkDockerVersion(ctx context.Context, h *Host, clusterVersion string) error {
 	info, err := h.DClient.Info(ctx)
 	if err != nil {
 		return fmt.Errorf("Can't retrieve Docker Info: %v", err)
 	}
 	logrus.Debugf("Docker Info found: %#v", info)
 	h.DockerInfo = info
+	K8sSemVer, err := util.StrToSemVer(clusterVersion)
+	if err != nil {
+		return fmt.Errorf("Error while parsing cluster version [%s]: %v", clusterVersion, err)
+	}
+	K8sVersion := fmt.Sprintf("%d.%d", K8sSemVer.Major, K8sSemVer.Minor)
 	isvalid, err := docker.IsSupportedDockerVersion(info, K8sVersion)
 	if err != nil {
 		return fmt.Errorf("Error while determining supported Docker version [%s]: %v", info.ServerVersion, err)
@@ -79,11 +87,7 @@ func parsePrivateKey(keyBuff string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey([]byte(keyBuff))
 }
 
-func parsePrivateKeyWithPassPhrase(keyBuff string, passphrase []byte) (ssh.Signer, error) {
-	return ssh.ParsePrivateKeyWithPassphrase([]byte(keyBuff), passphrase)
-}
-
-func getSSHConfig(username, sshPrivateKeyString string, passphrase []byte, useAgentAuth bool) (*ssh.ClientConfig, error) {
+func getSSHConfig(username, sshPrivateKeyString string, sshCertificateString string, useAgentAuth bool) (*ssh.ClientConfig, error) {
 	config := &ssh.ClientConfig{
 		User:            username,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -104,27 +108,61 @@ func getSSHConfig(username, sshPrivateKeyString string, passphrase []byte, useAg
 		}
 	}
 
-	signer, err := getPrivateKeySigner(sshPrivateKeyString, passphrase)
+	signer, err := parsePrivateKey(sshPrivateKeyString)
 	if err != nil {
 		return config, err
 	}
+
+	if len(sshCertificateString) > 0 {
+		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(sshCertificateString))
+		if err != nil {
+			return config, fmt.Errorf("Unable to parse SSH certificate: %v", err)
+		}
+
+		if _, ok := key.(*ssh.Certificate); !ok {
+			return config, fmt.Errorf("Unable to cast public key to SSH Certificate")
+		}
+		signer, err = ssh.NewCertSigner(key.(*ssh.Certificate), signer)
+		if err != nil {
+			return config, err
+		}
+	}
+
 	config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 
 	return config, nil
 }
 
-func getPrivateKeySigner(sshPrivateKeyString string, passphrase []byte) (ssh.Signer, error) {
-	key, err := parsePrivateKey(sshPrivateKeyString)
-	if err != nil && strings.Contains(err.Error(), "decode encrypted private keys") {
-		key, err = parsePrivateKeyWithPassPhrase(sshPrivateKeyString, passphrase)
+func privateKeyPath(sshKeyPath string) (string, error) {
+	if sshKeyPath[:2] == "~/" {
+		sshKeyPath = filepath.Join(userHome(), sshKeyPath[2:])
 	}
-	return key, err
+	buff, err := ioutil.ReadFile(sshKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("Error while reading SSH key file: %v", err)
+	}
+	return string(buff), nil
 }
 
-func privateKeyPath(sshKeyPath string) string {
-	if sshKeyPath[:2] == "~/" {
-		sshKeyPath = filepath.Join(os.Getenv("HOME"), sshKeyPath[2:])
+func certificatePath(sshCertPath string) (string, error) {
+	if sshCertPath[:2] == "~/" {
+		sshCertPath = filepath.Join(userHome(), sshCertPath[2:])
 	}
-	buff, _ := ioutil.ReadFile(sshKeyPath)
-	return string(buff)
+	buff, err := ioutil.ReadFile(sshCertPath)
+	if err != nil {
+		return "", fmt.Errorf("Error while reading SSH certificate file: %v", err)
+	}
+	return string(buff), nil
+}
+
+func userHome() string {
+	if home := os.Getenv("HOME"); home != "" {
+		return home
+	}
+	homeDrive := os.Getenv("HOMEDRIVE")
+	homePath := os.Getenv("HOMEPATH")
+	if homeDrive != "" && homePath != "" {
+		return homeDrive + homePath
+	}
+	return os.Getenv("USERPROFILE")
 }

@@ -17,6 +17,7 @@ type status struct {
 }
 
 type condition struct {
+	Reason  string
 	Type    string
 	Status  string
 	Message string
@@ -30,6 +31,7 @@ var transitioningMap = map[string]string{
 	"AddonDeploy":                 "provisioning",
 	"AgentDeployed":               "provisioning",
 	"BackingNamespaceCreated":     "configuring",
+	"Built":                       "building",
 	"CertsGenerated":              "provisioning",
 	"ConfigOK":                    "configuring",
 	"Created":                     "creating",
@@ -38,6 +40,8 @@ var transitioningMap = map[string]string{
 	"DefaultNetworkPolicyCreated": "configuring",
 	"DefaultProjectCreated":       "configuring",
 	"DockerProvisioned":           "provisioning",
+	"Deployed":                    "deploying",
+	"Drained":                     "draining",
 	"Downloaded":                  "downloading",
 	"etcd":                        "provisioning",
 	"Inactive":                    "deactivating",
@@ -47,6 +51,7 @@ var transitioningMap = map[string]string{
 	"Pending":                     "pending",
 	"PodScheduled":                "scheduling",
 	"Provisioned":                 "provisioning",
+	"Refreshed":                   "refreshed",
 	"Registered":                  "registering",
 	"Removed":                     "removing",
 	"Saved":                       "saving",
@@ -81,9 +86,10 @@ var errorMapping = map[string]bool{
 // False == transitioning
 // Unknown == error
 var doneMap = map[string]string{
-	"Completed": "activating",
-	"Ready":     "unavailable",
-	"Available": "updating",
+	"Completed":   "activating",
+	"Ready":       "unavailable",
+	"Available":   "updating",
+	"Progressing": "inactive",
 }
 
 // True == transitioning
@@ -98,10 +104,29 @@ func concat(str, next string) string {
 	if next == "" {
 		return str
 	}
+	if strings.EqualFold(str, next) {
+		return str
+	}
 	return str + "; " + next
 }
 
 func Set(data map[string]interface{}) {
+	genericStatus(data)
+	loadBalancerStatus(data)
+}
+
+func loadBalancerStatus(data map[string]interface{}) {
+	if data["state"] == "active" && data["kind"] == "Service" && values.GetValueN(data, "spec", "serviceKind") == "LoadBalancer" {
+		addresses, ok := values.GetSlice(data, "status", "loadBalancer", "ingress")
+		if !ok || len(addresses) == 0 {
+			data["state"] = "pending"
+			data["transitioning"] = "yes"
+			data["transitioningMessage"] = "Load balancer is being provisioned"
+		}
+	}
+}
+
+func genericStatus(data map[string]interface{}) {
 	if data == nil {
 		return
 	}
@@ -131,7 +156,7 @@ func Set(data map[string]interface{}) {
 	message := ""
 
 	for _, c := range conditions {
-		if errorMapping[c.Type] && c.Status == "False" {
+		if (errorMapping[c.Type] && c.Status == "False") || c.Reason == "Error" {
 			error = true
 			message = c.Message
 			break
@@ -209,10 +234,13 @@ func Set(data map[string]interface{}) {
 		}
 	}
 
-	if state == "" {
-		val, ok := values.GetValueN(data, "status", "phase").(string)
-		if val != "" && ok {
-			state = val
+	phase, ok := values.GetValueN(data, "status", "phase").(string)
+	if phase != "" && ok {
+		if phase == "Succeeded" {
+			state = "succeeded"
+			transitioning = false
+		} else if state == "" {
+			state = phase
 		}
 	}
 
@@ -243,7 +271,7 @@ func Set(data map[string]interface{}) {
 	data["state"] = strings.ToLower(state)
 	data["transitioningMessage"] = message
 
-	val, ok := values.GetValue(data, "metadata", "removed")
+	val, ok = values.GetValue(data, "metadata", "removed")
 	if ok && val != "" && val != nil {
 		data["state"] = "removing"
 		data["transitioning"] = "yes"
@@ -263,6 +291,10 @@ func Set(data map[string]interface{}) {
 		if ok && len(finalizers) > 0 {
 			parts := strings.Split(finalizers[0], "controller.cattle.io/")
 			f := parts[len(parts)-1]
+
+			if f == "foregroundDeletion" {
+				f = "object cleanup"
+			}
 
 			if len(msg) > 0 {
 				msg = msg + "; waiting on " + f

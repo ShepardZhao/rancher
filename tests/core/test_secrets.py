@@ -1,4 +1,4 @@
-from common import random_str
+from .common import random_str
 
 CERT = """-----BEGIN CERTIFICATE-----
 MIIDEDCCAfgCCQC+HwE8rpMN7jANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJV
@@ -49,8 +49,8 @@ iNITDKNP1H3hedFNFfbTGpueYdRX6QaptK4+NB4+dOm7hn8iqq7U
 -----END RSA PRIVATE KEY-----"""
 
 
-def test_secrets(pc):
-    client = pc.client
+def test_secrets(admin_pc):
+    client = admin_pc.client
 
     name = random_str()
     secret = client.create_secret(name=name, stringData={
@@ -60,9 +60,9 @@ def test_secrets(pc):
     assert secret.type == 'secret'
     assert secret.kind == 'Opaque'
     assert secret.name == name
-    assert secret.data['foo'] == 'YmFy'
+    assert secret.data.foo == 'YmFy'
 
-    secret.data['baz'] = 'YmFy'
+    secret.data.baz = 'YmFy'
     secret = client.update(secret, data=secret.data)
     secret = client.reload(secret)
 
@@ -70,11 +70,11 @@ def test_secrets(pc):
     assert secret.type == 'secret'
     assert secret.kind == 'Opaque'
     assert secret.name == name
-    assert secret.data['foo'] == 'YmFy'
-    assert secret.data['baz'] == 'YmFy'
+    assert secret.data.foo == 'YmFy'
+    assert secret.data.baz == 'YmFy'
     assert secret.namespaceId is None
-    assert 'namespace' not in secret
-    assert secret.projectId == pc.project.id
+    assert 'namespace' not in secret.data
+    assert secret.projectId == admin_pc.project.id
 
     found = False
     for i in client.list_secret():
@@ -87,8 +87,8 @@ def test_secrets(pc):
     client.delete(secret)
 
 
-def test_certificates(pc):
-    client = pc.client
+def test_certificates(admin_pc):
+    client = admin_pc.client
 
     name = random_str()
     cert = client.create_certificate(name=name, key=KEY, certs=CERT)
@@ -125,8 +125,8 @@ def test_certificates(pc):
     client.delete(cert)
 
 
-def test_docker_credential(pc):
-    client = pc.client
+def test_docker_credential(admin_pc):
+    client = admin_pc.client
 
     name = random_str()
     registries = {'index.docker.io': {
@@ -138,11 +138,11 @@ def test_docker_credential(pc):
     assert cert.baseType == 'secret'
     assert cert.type == 'dockerCredential'
     assert cert.name == name
-    assert cert.registries['index.docker.io']['username'] == 'foo'
+    assert cert.registries['index.docker.io'].username == 'foo'
     assert 'password' in cert.registries['index.docker.io']
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     registries['two'] = {
         'username': 'blah'
@@ -154,12 +154,12 @@ def test_docker_credential(pc):
     assert cert.baseType == 'secret'
     assert cert.type == 'dockerCredential'
     assert cert.name == name
-    assert cert.registries['index.docker.io']['username'] == 'foo'
-    assert cert.registries['two']['username'] == 'blah'
+    assert cert.registries['index.docker.io'].username == 'foo'
+    assert cert.registries.two.username == 'blah'
     assert 'password' not in cert.registries['index.docker.io']
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     found = False
     for i in client.list_docker_credential():
@@ -175,8 +175,8 @@ def test_docker_credential(pc):
     client.delete(cert)
 
 
-def test_basic_auth(pc):
-    client = pc.client
+def test_basic_auth(admin_pc):
+    client = admin_pc.client
 
     name = random_str()
     cert = client.create_basic_auth(name=name,
@@ -189,7 +189,7 @@ def test_basic_auth(pc):
     assert 'password' in cert
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     cert = client.update(cert, username='foo2')
     cert = client.reload(cert)
@@ -201,7 +201,7 @@ def test_basic_auth(pc):
     assert 'password' not in cert
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     found = False
     for i in client.list_basic_auth():
@@ -217,8 +217,8 @@ def test_basic_auth(pc):
     client.delete(cert)
 
 
-def test_ssh_auth(pc):
-    client = pc.client
+def test_ssh_auth(admin_pc):
+    client = admin_pc.client
 
     name = random_str()
     cert = client.create_ssh_auth(name=name,
@@ -229,7 +229,7 @@ def test_ssh_auth(pc):
     assert 'privateKey' in cert
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     cert = client.update(cert, privateKey='foo2')
     cert = client.reload(cert)
@@ -239,7 +239,7 @@ def test_ssh_auth(pc):
     assert 'privateKey' not in cert
     assert cert.namespaceId is None
     assert 'namespace' not in cert
-    assert cert.projectId == pc.project.id
+    assert cert.projectId == admin_pc.project.id
 
     found = False
     for i in client.list_ssh_auth():

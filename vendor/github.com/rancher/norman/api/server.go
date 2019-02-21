@@ -2,7 +2,7 @@ package api
 
 import (
 	"net/http"
-
+	"runtime/debug"
 	"sync"
 
 	"github.com/rancher/norman/api/access"
@@ -15,6 +15,7 @@ import (
 	"github.com/rancher/norman/parse"
 	"github.com/rancher/norman/store/wrapper"
 	"github.com/rancher/norman/types"
+	"github.com/sirupsen/logrus"
 )
 
 type StoreWrapper func(types.Store) types.Store
@@ -51,8 +52,20 @@ func NewAPIServer() *Server {
 	s := &Server{
 		Schemas: types.NewSchemas(),
 		ResponseWriters: map[string]ResponseWriter{
-			"json": &writer.JSONResponseWriter{},
-			"html": &writer.HTMLResponseWriter{},
+			"json": &writer.EncodingResponseWriter{
+				ContentType: "application/json",
+				Encoder:     types.JSONEncoder,
+			},
+			"html": &writer.HTMLResponseWriter{
+				EncodingResponseWriter: writer.EncodingResponseWriter{
+					Encoder:     types.JSONEncoder,
+					ContentType: "application/json",
+				},
+			},
+			"yaml": &writer.EncodingResponseWriter{
+				ContentType: "application/yaml",
+				Encoder:     types.YAMLEncoder,
+			},
 		},
 		SubContextAttributeProvider: &parse.DefaultSubContextAttributeProvider{},
 		Resolver:                    parse.DefaultResolver,
@@ -157,6 +170,13 @@ func (s *Server) setupDefaults(schema *types.Schema) {
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	defer func() {
+		if err := recover(); err != nil && err != http.ErrAbortHandler {
+			logrus.Error("Panic serving api request: \n" + string(debug.Stack()))
+			rw.WriteHeader(http.StatusInternalServerError)
+		}
+	}()
+
 	if apiResponse, err := s.handle(rw, req); err != nil {
 		s.handleError(apiResponse, err)
 	}
@@ -249,4 +269,18 @@ func (s *Server) handleError(apiRequest *types.APIContext, err error) {
 	} else if apiRequest.Schema.ErrorHandler != nil {
 		apiRequest.Schema.ErrorHandler(apiRequest, err)
 	}
+}
+
+func (s *Server) CustomAPIUIResponseWriter(cssURL, jsURL, version writer.StringGetter) {
+	wi, ok := s.ResponseWriters["html"]
+	if !ok {
+		return
+	}
+	w, ok := wi.(*writer.HTMLResponseWriter)
+	if !ok {
+		return
+	}
+	w.CSSURL = cssURL
+	w.JSURL = jsURL
+	w.APIUIVersion = version
 }

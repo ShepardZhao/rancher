@@ -13,10 +13,12 @@ import (
 
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/ehazlett/simplelog"
+	_ "github.com/rancher/norman/controller"
 	"github.com/rancher/norman/pkg/dump"
+	"github.com/rancher/norman/pkg/kwrapper/k8s"
 	"github.com/rancher/norman/signal"
 	"github.com/rancher/rancher/app"
-	"github.com/rancher/rancher/k8s"
+	"github.com/rancher/rancher/pkg/logserver"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -26,12 +28,15 @@ var (
 )
 
 func main() {
+	app.RegisterPasswordResetCommand()
+	app.RegisterEnsureDefaultAdminCommand()
 	if reexec.Init() {
 		return
 	}
 
 	os.Unsetenv("SSH_AUTH_SOCK")
 	os.Unsetenv("SSH_AGENT_PID")
+	os.Setenv("DISABLE_HTTP2", "true")
 
 	if dir, err := os.Getwd(); err == nil {
 		dmPath := filepath.Join(dir, "management-state", "bin")
@@ -45,6 +50,7 @@ func main() {
 
 	app := cli.NewApp()
 	app.Version = VERSION
+	app.Usage = "Complete container management platform"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "kubeconfig",
@@ -90,6 +96,40 @@ func main() {
 			Name:  "acme-domain",
 			Usage: "Domain to register with LetsEncrypt",
 		},
+		cli.BoolFlag{
+			Name:  "no-cacerts",
+			Usage: "Skip CA certs population in settings when set to true",
+		},
+		cli.StringFlag{
+			Name:   "audit-log-path",
+			EnvVar: "AUDIT_LOG_PATH",
+			Value:  "/var/log/auditlog/rancher-api-audit.log",
+			Usage:  "Log path for Rancher Server API. Default path is /var/log/auditlog/rancher-api-audit.log",
+		},
+		cli.IntFlag{
+			Name:   "audit-log-maxage",
+			Value:  10,
+			EnvVar: "AUDIT_LOG_MAXAGE",
+			Usage:  "Defined the maximum number of days to retain old audit log files",
+		},
+		cli.IntFlag{
+			Name:   "audit-log-maxbackup",
+			Value:  10,
+			EnvVar: "AUDIT_LOG_MAXBACKUP",
+			Usage:  "Defines the maximum number of audit log files to retain",
+		},
+		cli.IntFlag{
+			Name:   "audit-log-maxsize",
+			Value:  100,
+			EnvVar: "AUDIT_LOG_MAXSIZE",
+			Usage:  "Defines the maximum size in megabytes of the audit log file before it gets rotated, default size is 100M",
+		},
+		cli.IntFlag{
+			Name:   "audit-level",
+			Value:  0,
+			EnvVar: "AUDIT_LEVEL",
+			Usage:  "Audit log level: 0 - disable audit log, 1 - log event metadata, 2 - log event metadata and request body, 3 - log event metadata, request body and response body",
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
@@ -99,6 +139,13 @@ func main() {
 		}()
 
 		config.ACMEDomains = c.GlobalStringSlice("acme-domain")
+		config.NoCACerts = c.Bool("no-cacerts")
+
+		config.AuditLevel = c.Int("audit-level")
+		config.AuditLogPath = c.String("audit-log-path")
+		config.AuditLogMaxage = c.Int("audit-log-maxage")
+		config.AuditLogMaxbackup = c.Int("audit-log-maxbackup")
+		config.AuditLogMaxsize = c.Int("audit-log-maxsize")
 		initLogs(c, config)
 		return run(config)
 	}
@@ -124,12 +171,26 @@ func initLogs(c *cli.Context, cfg app.Config) {
 		logrus.SetFormatter(&logrus.JSONFormatter{})
 	}
 	logrus.SetOutput(os.Stdout)
-	//server.StartServerWithDefaults()
+	logserver.StartServerWithDefaults()
+}
+
+func migrateETCDlocal() {
+	if _, err := os.Stat("etcd"); err != nil {
+		return
+	}
+
+	// Purposely ignoring errors
+	os.Mkdir("management-state", 0700)
+	os.Symlink("../etcd", "management-state/etcd")
 }
 
 func run(cfg app.Config) error {
+	logrus.Infof("Rancher version %s is starting", VERSION)
+	logrus.Infof("Rancher arguments %+v", cfg)
 	dump.GoroutineDumpOn(syscall.SIGUSR1, syscall.SIGILL)
 	ctx := signal.SigTermCancelContext(context.Background())
+
+	migrateETCDlocal()
 
 	embedded, ctx, kubeConfig, err := k8s.GetConfig(ctx, cfg.K8sMode, cfg.KubeConfig)
 	if err != nil {

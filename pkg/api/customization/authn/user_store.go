@@ -12,6 +12,7 @@ import (
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/rancher/types/client/management/v3"
 	"github.com/rancher/types/config"
+	"github.com/rancher/types/user"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"k8s.io/client-go/tools/cache"
@@ -23,6 +24,7 @@ type userStore struct {
 	types.Store
 	mu          sync.Mutex
 	userIndexer cache.Indexer
+	userManager user.Manager
 }
 
 func SetUserStore(schema *types.Schema, mgmt *config.ScaledContext) {
@@ -36,6 +38,7 @@ func SetUserStore(schema *types.Schema, mgmt *config.ScaledContext) {
 		Store:       schema.Store,
 		mu:          sync.Mutex{},
 		userIndexer: userInformer.GetIndexer(),
+		userManager: mgmt.UserManager,
 	}
 
 	t := &transform.Store{
@@ -86,7 +89,7 @@ func hashPassword(data map[string]interface{}) error {
 	if !ok {
 		return errors.New("password not a string")
 	}
-	hashed, err := hashPasswordString(pass)
+	hashed, err := HashPasswordString(pass)
 	if err != nil {
 		return err
 	}
@@ -95,7 +98,7 @@ func hashPassword(data map[string]interface{}) error {
 	return nil
 }
 
-func hashPasswordString(password string) (string, error) {
+func HashPasswordString(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return "", errors.Wrap(err, "problem encrypting password")
@@ -174,4 +177,44 @@ func (s *userStore) create(apiContext *types.APIContext, schema *types.Schema, d
 	}
 
 	return s.Store.Create(apiContext, schema, data)
+}
+
+func (s *userStore) Update(apiContext *types.APIContext, schema *types.Schema, data map[string]interface{}, id string) (map[string]interface{}, error) {
+	currentUser, err := getUser(apiContext)
+	if err != nil {
+		return nil, err
+	}
+
+	willBeInactive := false
+	if val, ok := data[client.UserFieldEnabled].(bool); ok {
+		willBeInactive = !val
+	}
+
+	if currentUser == id && willBeInactive {
+		return nil, httperror.NewAPIError(httperror.InvalidAction, "You cannot deactivate yourself")
+	}
+
+	return s.Store.Update(apiContext, schema, data, id)
+}
+
+func (s *userStore) Delete(apiContext *types.APIContext, schema *types.Schema, id string) (map[string]interface{}, error) {
+	currentUser, err := getUser(apiContext)
+	if err != nil {
+		return nil, err
+	}
+
+	if currentUser == id {
+		return nil, httperror.NewAPIError(httperror.InvalidAction, "You cannot delete yourself")
+	}
+
+	return s.Store.Delete(apiContext, schema, id)
+}
+
+func getUser(apiContext *types.APIContext) (string, error) {
+	user := apiContext.Request.Header.Get("Impersonate-User")
+	if user == "" {
+		return "", httperror.NewAPIError(httperror.ServerError, "There was an error authorizing the user")
+	}
+
+	return user, nil
 }

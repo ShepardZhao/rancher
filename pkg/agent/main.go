@@ -1,3 +1,5 @@
+// +build !windows
+
 package main
 
 import (
@@ -9,16 +11,23 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	"github.com/rancher/norman/pkg/remotedialer"
+	"github.com/rancher/rancher/pkg/agent/clean"
 	"github.com/rancher/rancher/pkg/agent/cluster"
 	"github.com/rancher/rancher/pkg/agent/node"
-	"github.com/rancher/rancher/pkg/remotedialer"
+	"github.com/rancher/rancher/pkg/logserver"
 	"github.com/rancher/rancher/pkg/rkenodeconfigclient"
 	"github.com/sirupsen/logrus"
+)
+
+var (
+	VERSION = "dev"
 )
 
 const (
@@ -27,11 +36,20 @@ const (
 )
 
 func main() {
+	logserver.StartServerWithDefaults()
 	if os.Getenv("CATTLE_DEBUG") == "true" || os.Getenv("RANCHER_DEBUG") == "true" {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	if err := run(); err != nil {
+	var err error
+
+	if os.Getenv("CLUSTER_CLEANUP") == "true" {
+		err = clean.Cluster()
+	} else {
+		err = run()
+	}
+
+	if err != nil {
 		log.Fatal(err)
 	}
 }
@@ -82,6 +100,7 @@ func cleanup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer c.Close()
 
 	args := filters.NewArgs()
 	args.Add("label", "io.cattle.agent=true")
@@ -98,6 +117,12 @@ func cleanup(ctx context.Context) error {
 		if _, ok := container.Labels["io.kubernetes.pod.namespace"]; ok {
 			continue
 		}
+
+		if strings.Contains(container.Names[0], "share-mnt") {
+			continue
+		}
+
+		container := container
 		go func() {
 			time.Sleep(15 * time.Second)
 			logrus.Infof("Removing unmanaged agent %s(%s)", container.Names[0], container.ID)
@@ -111,11 +136,12 @@ func cleanup(ctx context.Context) error {
 }
 
 func run() error {
+	logrus.Infof("Rancher agent version %s is starting", VERSION)
 	params, err := getParams()
 	if err != nil {
 		return err
 	}
-
+	writeCertsOnly := os.Getenv("CATTLE_WRITE_CERT_ONLY") == "true"
 	bytes, err := json.Marshal(params)
 	if err != nil {
 		return err
@@ -139,11 +165,15 @@ func run() error {
 	onConnect := func(ctx context.Context) error {
 		connected()
 		connectConfig := fmt.Sprintf("https://%s/v3/connect/config", serverURL.Host)
-		if err := rkenodeconfigclient.ConfigClient(ctx, connectConfig, headers); err != nil {
+		if err := rkenodeconfigclient.ConfigClient(ctx, connectConfig, headers, writeCertsOnly); err != nil {
 			return err
 		}
 
 		if isCluster() {
+			err = cluster.RunControllers()
+			if err != nil {
+				logrus.Fatal(err)
+			}
 			return nil
 		}
 
@@ -156,7 +186,7 @@ func run() error {
 			for {
 				select {
 				case <-time.After(2 * time.Minute):
-					err := rkenodeconfigclient.ConfigClient(ctx, connectConfig, headers)
+					err := rkenodeconfigclient.ConfigClient(ctx, connectConfig, headers, writeCertsOnly)
 					if err != nil {
 						logrus.Errorf("failed to check plan: %v", err)
 					}

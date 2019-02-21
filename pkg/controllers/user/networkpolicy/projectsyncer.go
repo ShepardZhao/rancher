@@ -5,60 +5,55 @@ import (
 	"reflect"
 
 	"github.com/rancher/norman/condition"
-	"github.com/rancher/norman/objectclient"
-	typescorev1 "github.com/rancher/types/apis/core/v1"
 	"github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
 )
 
-type mgr struct {
-	pnpLister v3.ProjectNetworkPolicyLister
-	pnpClient *objectclient.ObjectClient
-	nsLister  typescorev1.NamespaceLister
-	nsClient  *objectclient.ObjectClient
-	K8sClient kubernetes.Interface
-}
-
 type projectSyncer struct {
-	pnpLister  v3.ProjectNetworkPolicyLister
-	pnpClient  *objectclient.ObjectClient
-	projClient *objectclient.ObjectClient
+	pnpLister        v3.ProjectNetworkPolicyLister
+	pnpClient        v3.ProjectNetworkPolicyInterface
+	projClient       v3.ProjectInterface
+	clusterLister    v3.ClusterLister
+	clusterNamespace string
 }
 
 // Sync is responsible for creating a default ProjectNetworkPolicy for
 // every project created. There is no need to worry about clean up, as
 // this pnp object is tied to the namespace of the project, it's deleted
 // automatically.
-func (ps *projectSyncer) Sync(key string, p *v3.Project) error {
+func (ps *projectSyncer) Sync(key string, p *v3.Project) (runtime.Object, error) {
 	if p == nil || p.DeletionTimestamp != nil {
-		return nil
+		return nil, nil
 	}
-
-	pcopy := p.DeepCopyObject()
-
-	pcopy, err := ps.createDefaultNetworkPolicy(pcopy)
+	disabled, err := isNetworkPolicyDisabled(ps.clusterNamespace, ps.clusterLister)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if disabled {
+		return nil, nil
+	}
+	updated, err := ps.createDefaultNetworkPolicy(p)
+	if err != nil {
+		return nil, err
 	}
 
 	// update if it has changed
-	if pcopy != nil && !reflect.DeepEqual(p, pcopy) {
-		_, err = ps.projClient.Update(p.Name, pcopy)
+	if updated != nil && !reflect.DeepEqual(p, updated) {
+		_, err = ps.projClient.Update(updated)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
-func (ps *projectSyncer) createDefaultNetworkPolicy(p runtime.Object) (runtime.Object, error) {
-	return v3.DefaultNetworkPolicyCreated.Do(p, func() (runtime.Object, error) {
+func (ps *projectSyncer) createDefaultNetworkPolicy(p *v3.Project) (*v3.Project, error) {
+	updated, err := v3.DefaultNetworkPolicyCreated.Do(p, func() (runtime.Object, error) {
 		o, err := meta.Accessor(p)
 		if err != nil {
 			return p, condition.Error("MissingMetadata", err)
@@ -90,4 +85,8 @@ func (ps *projectSyncer) createDefaultNetworkPolicy(p runtime.Object) (runtime.O
 
 		return p, nil
 	})
+	if err != nil {
+		return p, err
+	}
+	return updated.(*v3.Project), nil
 }

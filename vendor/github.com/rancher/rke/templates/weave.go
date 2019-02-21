@@ -21,9 +21,21 @@ items:
     spec:
       template:
         metadata:
+          annotations:
+            scheduler.alpha.kubernetes.io/tolerations: >-
+              [{"key":"dedicated","operator":"Equal","value":"master","effect":"NoSchedule"}]
           labels:
             name: weave-net
         spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                    - key: beta.kubernetes.io/os
+                      operator: NotIn
+                      values:
+                        - windows
           containers:
             - name: weave
               command:
@@ -36,8 +48,12 @@ items:
                       fieldPath: spec.nodeName
                 - name: IPALLOC_RANGE
                   value: "{{.ClusterCIDR}}"
+                {{- if .WeavePassword}}
+                - name: WEAVE_PASSWORD
+                  value: "{{.WeavePassword}}"
+                {{- end}}
               image: {{.Image}}
-              livenessProbe:
+              readinessProbe:
                 httpGet:
                   host: 127.0.0.1
                   path: /status
@@ -64,7 +80,6 @@ items:
                 - name: xtables-lock
                   mountPath: /run/xtables.lock
             - name: weave-npc
-              args: []
               env:
                 - name: HOSTNAME
                   valueFrom:
@@ -80,6 +95,15 @@ items:
               volumeMounts:
                 - name: xtables-lock
                   mountPath: /run/xtables.lock
+            - name: weave-plugins
+              command:
+                - /opt/rke-tools/weave-plugins-cni.sh
+              image: {{.WeaveLoopbackImage}}
+              securityContext:
+                privileged: true
+              volumeMounts:
+                - name: cni-bin
+                  mountPath: /opt
           hostNetwork: true
           hostPID: true
           restartPolicy: Always
@@ -87,8 +111,10 @@ items:
             seLinuxOptions: {}
           serviceAccountName: weave-net
           tolerations:
-            - effect: NoExecute
-              operator: Exists
+          - operator: Exists
+            effect: NoSchedule
+          - operator: Exists
+            effect: NoExecute
           volumes:
             - name: weavedb
               hostPath:
@@ -148,6 +174,13 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - ''
+    resources:
+      - nodes/status
+    verbs:
+      - patch
+      - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRoleBinding

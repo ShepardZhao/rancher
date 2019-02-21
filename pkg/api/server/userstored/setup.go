@@ -29,26 +29,30 @@ func Setup(ctx context.Context, mgmt *config.ScaledContext, clusterManager *clus
 
 	schemas := mgmt.Schemas
 
-	addProxyStore(schemas, mgmt, client.ConfigMapType, "v1", nil)
-	addProxyStore(schemas, mgmt, client.CronJobType, "batch/v1beta1", workload.New)
-	addProxyStore(schemas, mgmt, client.DaemonSetType, "apps/v1beta2", workload.New)
-	addProxyStore(schemas, mgmt, client.DeploymentType, "apps/v1beta2", workload.New)
-	addProxyStore(schemas, mgmt, client.IngressType, "extensions/v1beta1", ingress.Wrap)
-	addProxyStore(schemas, mgmt, client.JobType, "batch/v1", workload.New)
-	addProxyStore(schemas, mgmt, client.PersistentVolumeClaimType, "v1", nil)
-	addProxyStore(schemas, mgmt, client.PodType, "v1", func(store types.Store) types.Store {
+	addProxyStore(ctx, schemas, mgmt, client.ConfigMapType, "v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.CronJobType, "batch/v1beta1", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.DaemonSetType, "apps/v1beta2", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.DeploymentType, "apps/v1beta2", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.IngressType, "extensions/v1beta1", ingress.Wrap)
+	addProxyStore(ctx, schemas, mgmt, client.JobType, "batch/v1", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.PersistentVolumeClaimType, "v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.PodType, "v1", func(store types.Store) types.Store {
 		return pod.New(store, clusterManager, mgmt)
 	})
-	addProxyStore(schemas, mgmt, client.ReplicaSetType, "apps/v1beta2", workload.New)
-	addProxyStore(schemas, mgmt, client.ReplicationControllerType, "v1", workload.New)
-	addProxyStore(schemas, mgmt, client.ServiceType, "v1", service.New)
-	addProxyStore(schemas, mgmt, client.StatefulSetType, "apps/v1beta2", workload.New)
-	addProxyStore(schemas, mgmt, clusterClient.NamespaceType, "v1", namespace.New)
-	addProxyStore(schemas, mgmt, clusterClient.PersistentVolumeType, "v1", nil)
-	addProxyStore(schemas, mgmt, clusterClient.StorageClassType, "storage.k8s.io/v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.ReplicaSetType, "apps/v1beta2", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.ReplicationControllerType, "v1", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, client.ServiceType, "v1", service.New)
+	addProxyStore(ctx, schemas, mgmt, client.StatefulSetType, "apps/v1beta2", workload.NewCustomizeStore)
+	addProxyStore(ctx, schemas, mgmt, clusterClient.NamespaceType, "v1", namespace.New)
+	addProxyStore(ctx, schemas, mgmt, clusterClient.PersistentVolumeType, "v1", nil)
+	addProxyStore(ctx, schemas, mgmt, clusterClient.StorageClassType, "storage.k8s.io/v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.PrometheusType, "monitoring.coreos.com/v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.PrometheusRuleType, "monitoring.coreos.com/v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.AlertmanagerType, "monitoring.coreos.com/v1", nil)
+	addProxyStore(ctx, schemas, mgmt, client.ServiceMonitorType, "monitoring.coreos.com/v1", nil)
 
-	Secret(mgmt, schemas)
-	Service(schemas)
+	Secret(ctx, mgmt, schemas)
+	Service(ctx, schemas, mgmt)
 	Workload(schemas, clusterManager)
 	Namespace(schemas, clusterManager)
 
@@ -84,22 +88,29 @@ func SetProjectID(schemas *types.Schemas, clusterManager *clustermanager.Manager
 func Namespace(schemas *types.Schemas, manager *clustermanager.Manager) {
 	namespaceSchema := schemas.Schema(&clusterschema.Version, "namespace")
 	namespaceSchema.LinkHandler = namespacecustom.NewLinkHandler(namespaceSchema.LinkHandler, manager)
-	namespaceSchema.Formatter = yaml.NewFormatter(namespaceSchema.Formatter)
+	namespaceSchema.Formatter = namespacecustom.NewFormatter(yaml.NewFormatter(namespaceSchema.Formatter))
+	actionWrapper := namespacecustom.ActionWrapper{
+		ClusterManager: manager,
+	}
+	namespaceSchema.ActionHandler = actionWrapper.ActionHandler
 }
 
 func Workload(schemas *types.Schemas, clusterManager *clustermanager.Manager) {
-	workload.ConfigureStore(schemas, clusterManager)
+	workload.NewWorkloadAggregateStore(schemas, clusterManager)
 }
 
-func Service(schemas *types.Schemas) {
+func Service(ctx context.Context, schemas *types.Schemas, mgmt *config.ScaledContext) {
 	serviceSchema := schemas.Schema(&schema.Version, "service")
 	dnsSchema := schemas.Schema(&schema.Version, "dnsRecord")
+	// Move service store to DNSRecord and create new store on service, so they are then
+	// same store but two different instances
 	dnsSchema.Store = serviceSchema.Store
+	addProxyStore(ctx, schemas, mgmt, client.ServiceType, "v1", service.New)
 }
 
-func Secret(management *config.ScaledContext, schemas *types.Schemas) {
+func Secret(ctx context.Context, management *config.ScaledContext, schemas *types.Schemas) {
 	schema := schemas.Schema(&schema.Version, "namespacedSecret")
-	schema.Store = secret.NewNamespacedSecretStore(management.ClientGetter)
+	schema.Store = secret.NewNamespacedSecretStore(ctx, management.ClientGetter)
 
 	for _, subSchema := range schemas.Schemas() {
 		if subSchema.BaseType == schema.ID && subSchema.ID != schema.ID {

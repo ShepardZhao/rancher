@@ -2,83 +2,66 @@ package pipeline
 
 import (
 	"context"
-	"github.com/rancher/rancher/pkg/controllers/user/pipeline/remote"
-	"github.com/rancher/rancher/pkg/controllers/user/pipeline/utils"
+
+	"github.com/rancher/rancher/pkg/pipeline/providers"
+	"github.com/rancher/rancher/pkg/pipeline/remote"
+	"github.com/rancher/rancher/pkg/pipeline/utils"
 	"github.com/rancher/rancher/pkg/ref"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	"github.com/rancher/types/apis/project.cattle.io/v3"
 	"github.com/rancher/types/config"
-	"github.com/satori/uuid"
-	"github.com/sirupsen/logrus"
-	"time"
+	"github.com/satori/go.uuid"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
-//Lifecycle is responsible for watching pipelines and handling webhook management
-//in source code repository. It also helps to maintain labels on pipelines.
+// This controller is responsible for watching pipelines and handling
+// webhook management in source code providers.
+
 type Lifecycle struct {
-	pipelines                  v3.PipelineInterface
-	pipelineLister             v3.PipelineLister
+	clusterName                string
 	sourceCodeCredentialLister v3.SourceCodeCredentialLister
+	sourceCodeCredentials      v3.SourceCodeCredentialInterface
 }
 
 func Register(ctx context.Context, cluster *config.UserContext) {
 	clusterName := cluster.ClusterName
-	clusterPipelineLister := cluster.Management.Management.ClusterPipelines("").Controller().Lister()
-	pipelines := cluster.Management.Management.Pipelines("")
-	pipelineLister := pipelines.Controller().Lister()
-	pipelineExecutions := cluster.Management.Management.PipelineExecutions("")
-	sourceCodeCredentialLister := cluster.Management.Management.SourceCodeCredentials("").Controller().Lister()
+	pipelines := cluster.Management.Project.Pipelines("")
+	sourceCodeCredentials := cluster.Management.Project.SourceCodeCredentials("")
+	sourceCodeCredentialLister := sourceCodeCredentials.Controller().Lister()
 
 	pipelineLifecycle := &Lifecycle{
-		pipelines:                  pipelines,
-		pipelineLister:             pipelineLister,
+		clusterName:                clusterName,
 		sourceCodeCredentialLister: sourceCodeCredentialLister,
-	}
-	s := &CronSyncer{
-		clusterName:           clusterName,
-		clusterPipelineLister: clusterPipelineLister,
-		pipelineLister:        pipelineLister,
-		pipelines:             pipelines,
-		pipelineExecutions:    pipelineExecutions,
+		sourceCodeCredentials:      sourceCodeCredentials,
 	}
 
-	pipelines.AddClusterScopedLifecycle("pipeline-controller", cluster.ClusterName, pipelineLifecycle)
-	go s.sync(ctx, syncInterval)
+	pipelines.AddClusterScopedLifecycle(ctx, "pipeline-controller", cluster.ClusterName, pipelineLifecycle)
 }
 
-func (l *Lifecycle) Create(obj *v3.Pipeline) (*v3.Pipeline, error) {
+func (l *Lifecycle) Create(obj *v3.Pipeline) (runtime.Object, error) {
+	return obj, nil
+}
 
+func (l *Lifecycle) Updated(obj *v3.Pipeline) (runtime.Object, error) {
 	return l.sync(obj)
 }
 
-func (l *Lifecycle) Updated(obj *v3.Pipeline) (*v3.Pipeline, error) {
-
-	return l.sync(obj)
-}
-
-func (l *Lifecycle) Remove(obj *v3.Pipeline) (*v3.Pipeline, error) {
-
+func (l *Lifecycle) Remove(obj *v3.Pipeline) (runtime.Object, error) {
 	if obj.Status.WebHookID != "" {
-		if err := l.deleteHook(obj); err != nil {
-			//merely log error to avoid deletion block
-			logrus.Warnf("fail to delete previous set webhook for pipeline '%s' - %v", obj.Spec.DisplayName, err)
+		if err := l.deleteHook(obj); err != nil && !errors.IsNotFound(err) {
+			return obj, err
 		}
 	}
 	return obj, nil
 }
 
 func (l *Lifecycle) sync(obj *v3.Pipeline) (*v3.Pipeline, error) {
-
 	if obj.Status.Token == "" {
 		//random token for webhook validation
 		obj.Status.Token = uuid.NewV4().String()
 	}
 
-	//handle sourceCodeCredential info
-	if err := utils.ValidPipelineSpec(obj.Spec); err != nil {
-		return obj, err
-	}
-
-	sourceCodeCredentialID := obj.Spec.Stages[0].Steps[0].SourceCodeConfig.SourceCodeCredentialName
+	sourceCodeCredentialID := obj.Spec.SourceCodeCredentialName
 	if sourceCodeCredentialID != "" {
 		ns, name := ref.Parse(sourceCodeCredentialID)
 		if obj.Status.SourceCodeCredential == nil ||
@@ -94,25 +77,10 @@ func (l *Lifecycle) sync(obj *v3.Pipeline) (*v3.Pipeline, error) {
 		}
 	}
 
-	//handle cron
-	if obj.Spec.TriggerCronExpression == "" {
-		obj.Labels = map[string]string{utils.PipelineCronLabel: "false"}
-		if obj.Status.NextStart != "" {
-			obj.Status.NextStart = ""
-		}
-	} else {
-		obj.Labels = map[string]string{utils.PipelineCronLabel: "false"}
-		nextStart, err := getNextStartTime(obj.Spec.TriggerCronExpression, obj.Spec.TriggerCronTimezone, time.Now())
-		if err != nil {
-			return obj, err
-		}
-		obj.Status.NextStart = nextStart
-	}
-
 	//handle webhook
 	if obj.Status.WebHookID != "" && !hasWebhookTrigger(obj) {
 		if err := l.deleteHook(obj); err != nil {
-			logrus.Warnf("fail to delete previous set webhook for pipeline '%s' - %v", obj.Spec.DisplayName, err)
+			return obj, err
 		}
 		obj.Status.WebHookID = ""
 	} else if hasWebhookTrigger(obj) && obj.Status.WebHookID == "" {
@@ -127,28 +95,26 @@ func (l *Lifecycle) sync(obj *v3.Pipeline) (*v3.Pipeline, error) {
 }
 
 func (l *Lifecycle) createHook(obj *v3.Pipeline) (string, error) {
-	if err := utils.ValidPipelineSpec(obj.Spec); err != nil {
-		return "", err
-	}
-	credentialID := obj.Spec.Stages[0].Steps[0].SourceCodeConfig.SourceCodeCredentialName
+	credentialID := obj.Spec.SourceCodeCredentialName
 
 	ns, name := ref.Parse(credentialID)
 	credential, err := l.sourceCodeCredentialLister.Get(ns, name)
 	if err != nil {
 		return "", err
 	}
-	accessToken := credential.Spec.AccessToken
-	kind := credential.Spec.SourceCodeType
-	mockConfig := v3.ClusterPipeline{
-		Spec: v3.ClusterPipelineSpec{
-			GithubConfig: &v3.GithubClusterConfig{},
-		},
-	}
-	remote, err := remote.New(mockConfig, kind)
+	_, projID := ref.Parse(obj.Spec.ProjectName)
+	scpConfig, err := providers.GetSourceCodeProviderConfig(credential.Spec.SourceCodeType, projID)
 	if err != nil {
 		return "", err
 	}
-
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return "", err
+	}
+	accessToken, err := utils.EnsureAccessToken(l.sourceCodeCredentials, remote, credential)
+	if err != nil {
+		return "", err
+	}
 	id, err := remote.CreateHook(obj, accessToken)
 	if err != nil {
 		return "", err
@@ -157,33 +123,31 @@ func (l *Lifecycle) createHook(obj *v3.Pipeline) (string, error) {
 }
 
 func (l *Lifecycle) deleteHook(obj *v3.Pipeline) error {
-	if err := utils.ValidPipelineSpec(obj.Spec); err != nil {
-		return err
-	}
-	credentialID := obj.Spec.Stages[0].Steps[0].SourceCodeConfig.SourceCodeCredentialName
+	credentialID := obj.Spec.SourceCodeCredentialName
 
 	ns, name := ref.Parse(credentialID)
 	credential, err := l.sourceCodeCredentialLister.Get(ns, name)
 	if err != nil {
 		return err
 	}
-	accessToken := credential.Spec.AccessToken
-	kind := credential.Spec.SourceCodeType
-	mockConfig := v3.ClusterPipeline{
-		Spec: v3.ClusterPipelineSpec{
-			GithubConfig: &v3.GithubClusterConfig{},
-		},
-	}
-	remote, err := remote.New(mockConfig, kind)
+	_, projID := ref.Parse(obj.Spec.ProjectName)
+	scpConfig, err := providers.GetSourceCodeProviderConfig(credential.Spec.SourceCodeType, projID)
 	if err != nil {
 		return err
 	}
-
+	remote, err := remote.New(scpConfig)
+	if err != nil {
+		return err
+	}
+	accessToken, err := utils.EnsureAccessToken(l.sourceCodeCredentials, remote, credential)
+	if err != nil {
+		return err
+	}
 	return remote.DeleteHook(obj, accessToken)
 }
 
 func hasWebhookTrigger(obj *v3.Pipeline) bool {
-	if obj != nil && (obj.Spec.TriggerWebhookPr || obj.Spec.TriggerWebhookPush) {
+	if obj != nil && (obj.Spec.TriggerWebhookPr || obj.Spec.TriggerWebhookPush || obj.Spec.TriggerWebhookTag) {
 		return true
 	}
 	return false

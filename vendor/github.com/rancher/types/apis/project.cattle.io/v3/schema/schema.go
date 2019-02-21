@@ -3,6 +3,7 @@ package schema
 import (
 	"net/http"
 
+	monitoringv1 "github.com/coreos/prometheus-operator/pkg/client/monitoring/v1"
 	"github.com/rancher/norman/types"
 	m "github.com/rancher/norman/types/mapper"
 	"github.com/rancher/types/apis/project.cattle.io/v3"
@@ -42,7 +43,8 @@ var (
 		Init(podTemplateSpecTypes).
 		Init(workloadTypes).
 		Init(appTypes).
-		Init(namespaceComposeType)
+		Init(pipelineTypes).
+		Init(monitoringTypes)
 )
 
 func configMapTypes(schemas *types.Schemas) *types.Schemas {
@@ -114,13 +116,13 @@ func workloadTypes(schemas *types.Schemas) *types.Schemas {
 			}
 			schema.ResourceActions = map[string]types.Action{
 				"rollback": {
-					Input: "revision",
+					Input: "rollbackRevision",
 				},
 				"pause":  {},
 				"resume": {},
 			}
 			schema.MustCustomizeField("name", func(field types.Field) types.Field {
-				field.Type = "dnsLabel"
+				field.Type = "dnsLabelRestricted"
 				field.Nullable = false
 				field.Required = true
 				return field
@@ -164,6 +166,7 @@ func statefulSetTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Embed{Field: "template"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, v1beta2.StatefulSet{},
 			&m.Move{
 				From: "status",
@@ -174,8 +177,15 @@ func statefulSetTypes(schemas *types.Schemas) *types.Schemas {
 		MustImport(&Version, v1beta2.StatefulSetSpec{}, statefulSetConfigOverride{}).
 		MustImportAndCustomize(&Version, v1beta2.StatefulSet{}, func(schema *types.Schema) {
 			schema.BaseType = "workload"
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -191,6 +201,7 @@ func replicaSetTypes(schemas *types.Schemas) *types.Schemas {
 				To:   "replicaSetConfig/minReadySeconds",
 			},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, v1beta1.ReplicaSet{},
 			&m.Move{
 				From: "status",
@@ -202,8 +213,15 @@ func replicaSetTypes(schemas *types.Schemas) *types.Schemas {
 		MustImport(&Version, v1beta1.ReplicaSetSpec{}, replicaSetConfigOverride{}).
 		MustImportAndCustomize(&Version, v1beta1.ReplicaSet{}, func(schema *types.Schema) {
 			schema.BaseType = "workload"
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -220,6 +238,7 @@ func replicationControllerTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Embed{Field: "template"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, v1.ReplicationController{},
 			&m.Move{
 				From: "status",
@@ -232,8 +251,15 @@ func replicationControllerTypes(schemas *types.Schemas) *types.Schemas {
 			schema.BaseType = "workload"
 			schema.CollectionMethods = []string{http.MethodGet}
 			schema.ResourceMethods = []string{http.MethodGet}
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -260,6 +286,7 @@ func daemonSetTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Embed{Field: "template"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, v1beta2.DaemonSet{},
 			&m.Move{
 				From: "status",
@@ -270,8 +297,15 @@ func daemonSetTypes(schemas *types.Schemas) *types.Schemas {
 		MustImport(&Version, v1beta2.DaemonSetSpec{}, daemonSetOverride{}).
 		MustImportAndCustomize(&Version, v1beta2.DaemonSet{}, func(schema *types.Schema) {
 			schema.BaseType = "workload"
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -289,6 +323,7 @@ func jobTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Embed{Field: "template"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, batchv1.Job{},
 			&m.Move{
 				From: "status",
@@ -299,8 +334,15 @@ func jobTypes(schemas *types.Schemas) *types.Schemas {
 		MustImport(&Version, batchv1.JobSpec{}, jobOverride{}).
 		MustImportAndCustomize(&Version, batchv1.Job{}, func(schema *types.Schema) {
 			schema.BaseType = "workload"
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -349,6 +391,7 @@ func cronJobTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Drop{Field: "jobMetadata"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, batchv1beta1.CronJob{},
 			&m.Move{
 				From: "status",
@@ -360,15 +403,22 @@ func cronJobTypes(schemas *types.Schemas) *types.Schemas {
 		MustImport(&Version, batchv1beta1.JobTemplateSpec{}).
 		MustImportAndCustomize(&Version, batchv1beta1.CronJob{}, func(schema *types.Schema) {
 			schema.BaseType = "workload"
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
 func deploymentTypes(schemas *types.Schemas) *types.Schemas {
 	return schemas.
 		AddMapperForType(&Version, v1beta2.DeploymentStrategy{},
-			&m.Embed{Field: "rollingUpdate"},
+			&m.Embed{Field: "rollingUpdate", EmptyValueOk: true},
 			m.Enum{Field: "type", Options: []string{
 				"Recreate",
 				"RollingUpdate",
@@ -376,7 +426,11 @@ func deploymentTypes(schemas *types.Schemas) *types.Schemas {
 			m.Move{From: "type", To: "strategy"},
 		).
 		AddMapperForType(&Version, v1beta2.DeploymentSpec{},
-			&m.Embed{Field: "strategy"},
+			&m.Move{
+				From: "strategy",
+				To:   "upgradeStrategy",
+			},
+			&m.Embed{Field: "upgradeStrategy"},
 			&m.Move{
 				From: "replicas",
 				To:   "scale",
@@ -394,6 +448,7 @@ func deploymentTypes(schemas *types.Schemas) *types.Schemas {
 			},
 			&m.Embed{Field: "template"},
 		).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		AddMapperForType(&Version, v1beta2.Deployment{},
 			&m.Move{
 				From: "status",
@@ -412,8 +467,15 @@ func deploymentTypes(schemas *types.Schemas) *types.Schemas {
 				"pause":  {},
 				"resume": {},
 			}
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
 		}, projectOverride{}, struct {
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric]"`
 		}{})
 }
 
@@ -452,6 +514,9 @@ func podTypes(schemas *types.Schemas) *types.Schemas {
 			m.Move{From: "hostIP", To: "hostIp"},
 			m.Drop{Field: "hostPort"},
 		).
+		AddMapperForType(&Version, v1.Handler{},
+			mapper.ContainerProbeHandler{}).
+		AddMapperForType(&Version, v1.Probe{}, mapper.ContainerProbeHandler{}).
 		AddMapperForType(&Version, v1.Handler{}, handlerMapper).
 		AddMapperForType(&Version, v1.Probe{}, handlerMapper).
 		AddMapperForType(&Version, v1.PodStatus{},
@@ -461,14 +526,16 @@ func podTypes(schemas *types.Schemas) *types.Schemas {
 		AddMapperForType(&Version, v1.PodSpec{},
 			mapper.InitContainerMapper{},
 			mapper.SchedulingMapper{},
-			m.Move{From: "tolerations", To: "scheduling/tolerations", DestDefined: true},
+			m.Move{From: "tolerations", To: "scheduling/tolerate", DestDefined: true},
 			&m.Embed{Field: "securityContext"},
 			&m.Drop{Field: "serviceAccount"},
 		).
 		AddMapperForType(&Version, v1.Pod{},
 			&m.AnnotationField{Field: "description"},
 			&m.AnnotationField{Field: "publicEndpoints", List: true},
+			&m.AnnotationField{Field: "workloadMetrics", List: true},
 			mapper.ContainerPorts{},
+			mapper.ContainerStatus{},
 		).
 		// Must import handlers before Container
 		MustImport(&Version, v1.ContainerPort{}, struct {
@@ -483,12 +550,18 @@ func podTypes(schemas *types.Schemas) *types.Schemas {
 			Drop []string `norman:"type=array[enum],options=AUDIT_CONTROL|AUDIT_WRITE|BLOCK_SUSPEND|CHOWN|DAC_OVERRIDE|DAC_READ_SEARCH|FOWNER|FSETID|IPC_LOCK|IPC_OWNER|KILL|LEASE|LINUX_IMMUTABLE|MAC_ADMIN|MAC_OVERRIDE|MKNOD|NET_ADMIN|NET_BIND_SERVICE|NET_BROADCAST|NET_RAW|SETFCAP|SETGID|SETPCAP|SETUID|SYSLOG|SYS_ADMIN|SYS_BOOT|SYS_CHROOT|SYS_MODULE|SYS_NICE|SYS_PACCT|SYS_PTRACE|SYS_RAWIO|SYS_RESOURCE|SYS_TIME|SYS_TTY_CONFIG|WAKE_ALARM|ALL"`
 		}{}).
 		MustImport(&Version, v3.PublicEndpoint{}).
+		MustImport(&Version, v3.WorkloadMetric{}).
 		MustImport(&Version, v1.Handler{}, handlerOverride{}).
 		MustImport(&Version, v1.Probe{}, handlerOverride{}).
 		MustImport(&Version, v1.Container{}, struct {
-			Environment     map[string]string
-			EnvironmentFrom []EnvironmentFrom
-			InitContainer   bool
+			Environment          map[string]string
+			EnvironmentFrom      []EnvironmentFrom
+			InitContainer        bool
+			State                string
+			Transitioning        string
+			TransitioningMessage string
+			ExitCode             *int
+			RestartCount         int
 		}{}).
 		MustImport(&Version, v1.PodSpec{}, struct {
 			Scheduling *Scheduling
@@ -498,6 +571,7 @@ func podTypes(schemas *types.Schemas) *types.Schemas {
 			Description     string `json:"description"`
 			WorkloadID      string `norman:"type=reference[workload]"`
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
+			WorkloadMetrics string `json:"workloadMetrics" norman:"type=array[workloadMetric],nocreate,noupdate"`
 		}{})
 }
 
@@ -528,7 +602,6 @@ func addServiceOrDNSRecord(dns bool) types.SchemasInitFunc {
 		schemas = schemas.
 			AddMapperForType(&Version, v1.ServiceSpec{},
 				&m.Move{From: "externalName", To: "hostname"},
-				&ServiceSpecMapper{},
 				&m.Move{From: "type", To: "serviceKind"},
 				&m.SetValue{
 					Field: "clusterIP",
@@ -577,7 +650,7 @@ func addServiceOrDNSRecord(dns bool) types.SchemasInitFunc {
 					return f
 				})
 				schema.MustCustomizeField("name", func(field types.Field) types.Field {
-					field.Type = "dnsLabel"
+					field.Type = "dnsLabelRestricted"
 					field.Nullable = false
 					field.Required = true
 					return field
@@ -596,9 +669,6 @@ func addServiceOrDNSRecord(dns bool) types.SchemasInitFunc {
 
 func ingressTypes(schemas *types.Schemas) *types.Schemas {
 	return schemas.
-		AddMapperForType(&Version, v1beta1.HTTPIngressRuleValue{},
-			&m.SliceToMap{Field: "paths", Key: "path"},
-		).
 		AddMapperForType(&Version, v1beta1.HTTPIngressPath{},
 			&m.Embed{Field: "backend"},
 		).
@@ -620,16 +690,17 @@ func ingressTypes(schemas *types.Schemas) *types.Schemas {
 			WorkloadIDs string `json:"workloadIds" norman:"type=array[reference[workload]]"`
 			ServiceName string `norman:"type=reference[service]"`
 		}{}).
-		MustImportAndCustomize(&Version, v1beta1.IngressRule{}, func(schema *types.Schema) {
-			schema.MustCustomizeField("paths", func(f types.Field) types.Field {
-				f.Type = "map[ingressBackend]"
-				return f
-			})
-		}).
+		MustImport(&Version, v1beta1.IngressRule{}).
 		MustImport(&Version, v1beta1.IngressTLS{}, struct {
 			SecretName string `norman:"type=reference[certificate]"`
 		}{}).
-		MustImport(&Version, v1beta1.Ingress{}, projectOverride{}, struct {
+		MustImportAndCustomize(&Version, v1beta1.Ingress{}, func(schema *types.Schema) {
+			schema.MustCustomizeField("name", func(f types.Field) types.Field {
+				f.Required = true
+				f.Nullable = false
+				return f
+			})
+		}, projectOverride{}, struct {
 			Description     string `json:"description"`
 			PublicEndpoints string `json:"publicEndpoints" norman:"type=array[publicEndpoint],nocreate,noupdate"`
 		}{})
@@ -661,11 +732,13 @@ func volumeTypes(schemas *types.Schemas) *types.Schemas {
 				"name",
 			}},
 		).
+		AddMapperForType(&Version, v1.PersistentVolumeClaim{},
+			mapper.PersistVolumeClaim{},
+		).
 		MustImport(&Version, v1.PersistentVolumeClaimVolumeSource{}, struct {
 			ClaimName string `norman:"type=reference[persistentVolumeClaim]"`
 		}{}).
 		MustImport(&Version, v1.SecretVolumeSource{}, struct {
-			SecretName string `norman:"type=reference[secret]"`
 		}{}).
 		MustImport(&Version, v1.VolumeMount{}, struct {
 			MountPath string `json:"mountPath" norman:"required"`
@@ -685,11 +758,16 @@ func volumeTypes(schemas *types.Schemas) *types.Schemas {
 
 func appTypes(schema *types.Schemas) *types.Schemas {
 	return schema.
+		AddMapperForType(&Version, v3.App{}, &m.Embed{Field: "status"}).
+		MustImport(&Version, v3.AppUpgradeConfig{}).
+		MustImport(&Version, v3.RollbackRevision{}).
 		MustImportAndCustomize(&Version, v3.App{}, func(schema *types.Schema) {
 			schema.ResourceActions = map[string]types.Action{
-				"upgrade": {},
+				"upgrade": {
+					Input: "appUpgradeConfig",
+				},
 				"rollback": {
-					Input: "revision",
+					Input: "rollbackRevision",
 				},
 			}
 		}).
@@ -711,9 +789,234 @@ func NewWorkloadTypeMapper() types.Mapper {
 		mapper.ContainerPorts{},
 		mapper.WorkloadAnnotations{},
 		&m.AnnotationField{Field: "publicEndpoints", List: true},
+		&m.AnnotationField{Field: "workloadMetrics", List: true},
 	}
 }
 
-func namespaceComposeType(schemas *types.Schemas) *types.Schemas {
-	return schemas.MustImport(&Version, v3.NamespaceComposeConfig{})
+func pipelineTypes(schema *types.Schemas) *types.Schemas {
+	baseProviderCustomizeFunc := func(schema *types.Schema) {
+		schema.BaseType = "sourceCodeProvider"
+		schema.ResourceActions = map[string]types.Action{
+			"login": {
+				Input:  "authUserInput",
+				Output: "sourceCodeCredential",
+			},
+		}
+		schema.CollectionMethods = []string{}
+		schema.ResourceMethods = []string{http.MethodGet}
+	}
+	return schema.
+		AddMapperForType(&Version, v3.SourceCodeProviderConfig{}).
+		AddMapperForType(&Version, v3.Pipeline{},
+			&m.Embed{Field: "status"},
+			m.DisplayName{}).
+		AddMapperForType(&Version, v3.PipelineExecution{},
+			&m.Embed{Field: "status"}).
+		AddMapperForType(&Version, v3.SourceCodeCredential{},
+			&m.Embed{Field: "status"}).
+		AddMapperForType(&Version, v3.SourceCodeRepository{}).
+		MustImport(&Version, v3.AuthAppInput{}).
+		MustImport(&Version, v3.AuthUserInput{}).
+		MustImport(&Version, v3.RunPipelineInput{}).
+		MustImport(&Version, v3.PushPipelineConfigInput{}).
+		MustImport(&Version, v3.GithubApplyInput{}).
+		MustImport(&Version, v3.GitlabApplyInput{}).
+		MustImport(&Version, v3.BitbucketCloudApplyInput{}).
+		MustImport(&Version, v3.BitbucketServerApplyInput{}).
+		MustImport(&Version, v3.BitbucketServerRequestLoginInput{}).
+		MustImport(&Version, v3.BitbucketServerRequestLoginOutput{}).
+		MustImportAndCustomize(&Version, v3.SourceCodeProvider{}, func(schema *types.Schema) {
+			schema.CollectionMethods = []string{http.MethodGet}
+		}).
+		MustImportAndCustomize(&Version, v3.GithubProvider{}, baseProviderCustomizeFunc).
+		MustImportAndCustomize(&Version, v3.GitlabProvider{}, baseProviderCustomizeFunc).
+		MustImportAndCustomize(&Version, v3.BitbucketCloudProvider{}, baseProviderCustomizeFunc).
+		MustImportAndCustomize(&Version, v3.BitbucketServerProvider{}, func(schema *types.Schema) {
+			schema.BaseType = "sourceCodeProvider"
+			schema.ResourceActions = map[string]types.Action{
+				"requestLogin": {
+					Output: "bitbucketServerRequestLoginOutput",
+				},
+				"login": {
+					Input:  "authUserInput",
+					Output: "sourceCodeCredential",
+				},
+			}
+			schema.CollectionMethods = []string{}
+			schema.ResourceMethods = []string{http.MethodGet}
+		}).
+		//Github Integration Config
+		MustImportAndCustomize(&Version, v3.SourceCodeProviderConfig{}, func(schema *types.Schema) {
+			schema.CollectionMethods = []string{http.MethodGet}
+		}).
+		MustImportAndCustomize(&Version, v3.GithubPipelineConfig{}, func(schema *types.Schema) {
+			schema.BaseType = "sourceCodeProviderConfig"
+			schema.ResourceActions = map[string]types.Action{
+				"disable": {},
+				"testAndApply": {
+					Input: "githubApplyInput",
+				},
+			}
+			schema.CollectionMethods = []string{}
+			schema.ResourceMethods = []string{http.MethodGet, http.MethodPut}
+		}).
+		MustImportAndCustomize(&Version, v3.GitlabPipelineConfig{}, func(schema *types.Schema) {
+			schema.BaseType = "sourceCodeProviderConfig"
+			schema.ResourceActions = map[string]types.Action{
+				"disable": {},
+				"testAndApply": {
+					Input: "gitlabApplyInput",
+				},
+			}
+			schema.CollectionMethods = []string{}
+			schema.ResourceMethods = []string{http.MethodGet, http.MethodPut}
+		}).
+		MustImportAndCustomize(&Version, v3.BitbucketCloudPipelineConfig{}, func(schema *types.Schema) {
+			schema.BaseType = "sourceCodeProviderConfig"
+			schema.ResourceActions = map[string]types.Action{
+				"disable": {},
+				"testAndApply": {
+					Input: "bitbucketCloudApplyInput",
+				},
+			}
+			schema.CollectionMethods = []string{}
+			schema.ResourceMethods = []string{http.MethodGet, http.MethodPut}
+		}).MustImportAndCustomize(&Version, v3.BitbucketServerPipelineConfig{}, func(schema *types.Schema) {
+		schema.BaseType = "sourceCodeProviderConfig"
+		schema.ResourceActions = map[string]types.Action{
+			"disable":      {},
+			"generateKeys": {},
+			"requestLogin": {
+				Input:  "bitbucketServerRequestLoginInput",
+				Output: "bitbucketServerRequestLoginOutput",
+			},
+			"testAndApply": {
+				Input: "bitbucketServerApplyInput",
+			},
+		}
+		schema.CollectionMethods = []string{}
+		schema.ResourceMethods = []string{http.MethodGet, http.MethodPut}
+	}).
+		MustImportAndCustomize(&Version, v3.Pipeline{}, func(schema *types.Schema) {
+			schema.ResourceActions = map[string]types.Action{
+				"activate":   {},
+				"deactivate": {},
+				"run": {
+					Input: "runPipelineInput",
+				},
+				"pushconfig": {
+					Input: "pushPipelineConfigInput",
+				},
+			}
+		}).
+		MustImportAndCustomize(&Version, v3.PipelineExecution{}, func(schema *types.Schema) {
+			schema.ResourceActions = map[string]types.Action{
+				"stop":  {},
+				"rerun": {},
+			}
+		}).
+		MustImportAndCustomize(&Version, v3.PipelineSetting{}, func(schema *types.Schema) {
+			schema.MustCustomizeField("name", func(f types.Field) types.Field {
+				f.Required = true
+				return f
+			})
+		}).
+		MustImportAndCustomize(&Version, v3.SourceCodeCredential{}, func(schema *types.Schema) {
+			delete(schema.ResourceFields, "namespaceId")
+			schema.ResourceMethods = []string{http.MethodGet, http.MethodDelete}
+			schema.ResourceActions = map[string]types.Action{
+				"refreshrepos": {},
+				"logout":       {},
+			}
+		}).
+		MustImportAndCustomize(&Version, v3.SourceCodeRepository{}, func(schema *types.Schema) {
+			delete(schema.ResourceFields, "namespaceId")
+			schema.ResourceMethods = []string{http.MethodGet, http.MethodDelete}
+		})
+
+}
+
+func monitoringTypes(schemas *types.Schemas) *types.Schemas {
+	return schemas.
+		AddMapperForType(&Version, monitoringv1.StorageSpec{},
+			&m.Drop{Field: "class"},
+			&m.Drop{Field: "selector"},
+			&m.Drop{Field: "resources"},
+		).
+		AddMapperForType(&Version, monitoringv1.Prometheus{},
+			&m.Drop{Field: "status"},
+			&m.AnnotationField{Field: "description"},
+		).
+		AddMapperForType(&Version, monitoringv1.PrometheusSpec{},
+			&m.Drop{Field: "thanos"},
+			&m.Drop{Field: "apiserverConfig"},
+			&m.Drop{Field: "serviceMonitorNamespaceSelector"},
+			&m.Drop{Field: "ruleNamespaceSelector"},
+			&m.Drop{Field: "paused"},
+			&m.Enum{
+				Field: "logLevel",
+				Options: []string{
+					"all",
+					"debug",
+					"info",
+					"warn",
+					"error",
+					"none",
+				},
+			},
+		).
+		MustImportAndCustomize(&Version, monitoringv1.Prometheus{}, func(schema *types.Schema) {
+			schema.MustCustomizeField("name", func(field types.Field) types.Field {
+				field.Type = "dnsLabelRestricted"
+				field.Nullable = false
+				field.Required = true
+				return field
+			})
+		}, projectOverride{}, struct {
+			Description string `json:"description"`
+		}{}).
+		AddMapperForType(&Version, monitoringv1.RelabelConfig{},
+			&m.Enum{
+				Field: "action",
+				Options: []string{
+					"replace",
+					"keep",
+					"drop",
+					"hashmod",
+					"labelmap",
+					"labeldrop",
+					"labelkeep",
+				},
+			},
+		).
+		AddMapperForType(&Version, monitoringv1.Endpoint{},
+			&m.Drop{Field: "port"},
+			&m.Drop{Field: "tlsConfig"},
+			&m.Drop{Field: "bearerTokenFile"},
+			&m.Drop{Field: "honorLabels"},
+			&m.Drop{Field: "basicAuth"},
+			&m.Drop{Field: "metricRelabelings"},
+			&m.Drop{Field: "proxyUrl"},
+		).
+		AddMapperForType(&Version, monitoringv1.ServiceMonitorSpec{},
+			&m.Embed{Field: "namespaceSelector"},
+			&m.Drop{Field: "any"},
+			&m.Move{From: "matchNames", To: "namespaceSelector"},
+		).
+		AddMapperForType(&Version, monitoringv1.ServiceMonitor{},
+			&m.AnnotationField{Field: "displayName"},
+			&m.DisplayName{},
+			&m.AnnotationField{Field: "targetService"},
+			&m.AnnotationField{Field: "targetWorkload"},
+		).
+		MustImport(&Version, monitoringv1.ServiceMonitor{}, projectOverride{}, struct {
+			DisplayName    string `json:"displayName,omitempty"`
+			TargetService  string `json:"targetService,omitempty"`
+			TargetWorkload string `json:"targetWorkload,omitempty"`
+		}{}).
+		MustImport(&Version, monitoringv1.PrometheusRule{}, projectOverride{}).
+		AddMapperForType(&Version, monitoringv1.Alertmanager{},
+			&m.Drop{Field: "status"},
+		).
+		MustImport(&Version, monitoringv1.Alertmanager{}, projectOverride{})
 }

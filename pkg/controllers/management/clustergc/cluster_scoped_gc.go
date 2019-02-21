@@ -1,6 +1,7 @@
 package clustergc
 
 import (
+	"context"
 	"strings"
 
 	"github.com/rancher/norman/lifecycle"
@@ -18,7 +19,7 @@ const (
 	prtbByClusterIndex = "managment.cattle.io/prtb-by-cluster"
 )
 
-func Register(management *config.ManagementContext) {
+func Register(ctx context.Context, management *config.ManagementContext) {
 	informer := management.Management.ProjectRoleTemplateBindings("").Controller().Informer()
 	indexers := map[string]cache.IndexFunc{
 		prtbByClusterIndex: prtbByCluster,
@@ -30,7 +31,7 @@ func Register(management *config.ManagementContext) {
 		grbLister:          management.Management.GlobalRoleBindings("").Controller().Lister(),
 		projectLister:      management.Management.Projects("").Controller().Lister(),
 		crtbLister:         management.Management.ClusterRoleTemplateBindings("").Controller().Lister(),
-		projectAlertLister: management.Management.ProjectAlerts("").Controller().Lister(),
+		projectAlertLister: management.Management.ProjectAlertGroups("").Controller().Lister(),
 		nodeLister:         management.Management.Nodes("").Controller().Lister(),
 		psptLister:         management.Management.PodSecurityPolicyTemplates("").Controller().Lister(),
 		secretsLister:      management.Core.Secrets("").Controller().Lister(),
@@ -38,13 +39,13 @@ func Register(management *config.ManagementContext) {
 		mgmt:               management,
 	}
 
-	management.Management.Clusters("").AddLifecycle("cluster-scoped-gc", gc)
+	management.Management.Clusters("").AddLifecycle(ctx, "cluster-scoped-gc", gc)
 }
 
 type gcLifecycle struct {
 	projectLister      v3.ProjectLister
 	crtbLister         v3.ClusterRoleTemplateBindingLister
-	projectAlertLister v3.ProjectAlertLister
+	projectAlertLister v3.ProjectAlertGroupLister
 	prtbIndexer        cache.Indexer
 	nodeLister         v3.NodeLister
 	rtLister           v3.RoleTemplateLister
@@ -54,11 +55,11 @@ type gcLifecycle struct {
 	mgmt               *config.ManagementContext
 }
 
-func (c *gcLifecycle) Create(obj *v3.Cluster) (*v3.Cluster, error) {
+func (c *gcLifecycle) Create(obj *v3.Cluster) (runtime.Object, error) {
 	return obj, nil
 }
 
-func (c *gcLifecycle) Updated(obj *v3.Cluster) (*v3.Cluster, error) {
+func (c *gcLifecycle) Updated(obj *v3.Cluster) (runtime.Object, error) {
 	return nil, nil
 }
 
@@ -86,7 +87,7 @@ func cleanFinalizers(clusterName string, object runtime.Object, client *objectcl
 	return nil
 }
 
-func (c *gcLifecycle) Remove(cluster *v3.Cluster) (*v3.Cluster, error) {
+func (c *gcLifecycle) Remove(cluster *v3.Cluster) (runtime.Object, error) {
 	rts, err := c.rtLister.List("", labels.Everything())
 	if err != nil {
 		return cluster, err
@@ -135,7 +136,7 @@ func (c *gcLifecycle) Remove(cluster *v3.Cluster) (*v3.Cluster, error) {
 	if err != nil {
 		return cluster, err
 	}
-	oClient = c.mgmt.Management.ProjectAlerts("").ObjectClient()
+	oClient = c.mgmt.Management.ProjectAlertGroups("").ObjectClient()
 	for _, p := range alerts {
 		if err := cleanFinalizers(cluster.Name, p, oClient); err != nil {
 			return cluster, err
